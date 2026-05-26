@@ -14,8 +14,7 @@ jobs:
     env:
       # 从 GitHub Secrets 注入
       USERNAME_AND_PASSWORD: ${{ secrets.USERNAME_AND_PASSWORD }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
 
     steps:
       - name: Checkout

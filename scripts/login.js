@@ -3,7 +3,7 @@
 // 支持多个账户的JSON格式：{"email1@example.com": "password1", "email2@example.com": "password2"}
 // 环境变量（通过 GitHub Secrets 注入）：
 //   USERNAME_AND_PASSWORD - 包含所有账户的JSON字符串
-//   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+//   FEISHU_WEBHOOK - 飞书群机器人 Webhook 地址
 
 import { chromium } from '@playwright/test';
 import fs from 'fs';
@@ -13,91 +13,91 @@ const MAX_RETRIES = 2; // 每个账户的最大重试次数
 const NAVIGATION_TIMEOUT = 60_000; // 导航超时时间（60秒）
 const DEFAULT_WAIT_TIME = 5000; // 默认等待时间（5秒）
 
-// Telegram 通知
-async function notifyTelegram({ ok, stage, msg, screenshotPath, username }) {
+// 飞书 Webhook 通知
+async function notifyFeishu({ ok, stage, msg, screenshotPath, username }) {
   try {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) {
-      console.log('[WARN] TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，跳过通知');
+    const webhook = process.env.FEISHU_WEBHOOK;
+    if (!webhook) {
+      console.log('[WARN] FEISHU_WEBHOOK 未设置，跳过通知');
       return;
     }
 
-    const text = [
-      `🔔 Lunes 自动登录${username ? ` (${username})` : ''}：${ok ? '✅ 成功' : '❌ 失败'}`,
+    const title = `Lunes 自动登录${username ? ` (${username})` : ''}`;
+    const status = ok ? '✅ 成功' : '❌ 失败';
+    const lines = [
+      `状态：${status}`,
       `阶段：${stage}`,
       msg ? `信息：${msg}` : '',
-      `时间：${new Date().toISOString()}`
-    ].filter(Boolean).join('\n');
+      `时间：${new Date().toISOString()}`,
+      screenshotPath ? '（截图已保存到 GitHub Actions Artifacts）' : ''
+    ].filter(Boolean);
 
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    await fetch(url, {
+    const content = lines.map(line => [{ tag: 'text', text: line }]);
+
+    await fetch(webhook, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        disable_web_page_preview: true
+        msg_type: 'post',
+        content: {
+          post: {
+            zh_cn: {
+              title,
+              content
+            }
+          }
+        }
       })
     });
-
-    // 若有截图，再发一张
-    if (screenshotPath && fs.existsSync(screenshotPath)) {
-      const photoUrl = `https://api.telegram.org/bot${token}/sendPhoto`;
-      const formData = new FormData();
-      const imageBuffer = fs.readFileSync(screenshotPath);
-      const blob = new Blob([imageBuffer], { type: 'image/png' });
-      formData.append('chat_id', chatId);
-      formData.append('caption', `Lunes 自动登录截图（${stage}${username ? ` - ${username}` : ''}）`);
-      formData.append('photo', blob, 'screenshot.png');
-      
-      await fetch(photoUrl, { 
-        method: 'POST', 
-        body: formData 
-      });
-    }
   } catch (e) {
-    console.log('[WARN] Telegram 通知失败：', e.message);
+    console.log('[WARN] 飞书通知失败：', e.message);
   }
 }
 
 // 发送汇总通知
 async function sendSummaryNotification(results) {
   try {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) {
-      console.log('[WARN] TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，跳过汇总通知');
+    const webhook = process.env.FEISHU_WEBHOOK;
+    if (!webhook) {
+      console.log('[WARN] FEISHU_WEBHOOK 未设置，跳过汇总通知');
       return;
     }
 
     const successCount = results.filter(r => r.success).length;
     const totalCount = results.length;
 
-    const text = [
-      `📊 Lunes 自动登录汇总报告`,
+    const lines = [
       `总账户数: ${totalCount}`,
       `成功: ${successCount}`,
       `失败: ${totalCount - successCount}`,
-      `\n详细结果:`,
-      ...results.map((r, index) => 
+      '',
+      '详细结果:',
+      ...results.map((r, index) =>
         `${index + 1}. ${r.username}: ${r.success ? '✅ 成功' : '❌ 失败'}${r.message ? ` (${r.message})` : ''}${r.retries > 0 ? ` [重试: ${r.retries}]` : ''}`
       ),
-      `\n时间: ${new Date().toISOString()}`
-    ].join('\n');
+      '',
+      `时间: ${new Date().toISOString()}`
+    ];
 
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    await fetch(url, {
+    const content = lines.map(line => [{ tag: 'text', text: line }]);
+
+    await fetch(webhook, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        disable_web_page_preview: true
+        msg_type: 'post',
+        content: {
+          post: {
+            zh_cn: {
+              title: '📊 Lunes 自动登录汇总报告',
+              content
+            }
+          }
+        }
       })
     });
   } catch (e) {
-    console.log('[WARN] Telegram 汇总通知失败：', e.message);
+    console.log('[WARN] 飞书汇总通知失败：', e.message);
   }
 }
 
@@ -170,7 +170,7 @@ async function attemptLogin(username, password, index, retryCount) {
     if (await humanCheckText.count()) {
       const sp = screenshot('01-human-check');
       await page.screenshot({ path: sp, fullPage: true });
-      await notifyTelegram({
+      await notifyFeishu({
         ok: false,
         stage: '打开登录页',
         msg: '检测到人机验证页面（Cloudflare/Turnstile），自动化已停止。',
@@ -262,7 +262,7 @@ async function attemptLogin(username, password, index, retryCount) {
 
     if (!stillOnLogin || successHint > 0) {
       console.log(`[${username}] ✅ 登录成功`);
-      await notifyTelegram({
+      await notifyFeishu({
         ok: true,
         stage: '登录结果',
         msg: `判断为成功。当前 URL：${url}`,
@@ -307,7 +307,7 @@ async function attemptLogin(username, password, index, retryCount) {
     }
 
     console.log(`[${username}] ❌ 登录失败: ${errorMsg || '未知错误'}`);
-    await notifyTelegram({
+    await notifyFeishu({
       ok: false,
       stage: '登录结果',
       msg: errorMsg ? `登录失败: ${errorMsg}` : '登录失败（原因未知）',
@@ -320,7 +320,7 @@ async function attemptLogin(username, password, index, retryCount) {
     const sp = screenshot('99-error');
     try { await page.screenshot({ path: sp, fullPage: true }); } catch {}
     console.error(`[${username}] 💥 发生异常:`, e.message);
-    await notifyTelegram({
+    await notifyFeishu({
       ok: false,
       stage: '异常',
       msg: e?.message || String(e),
@@ -390,7 +390,7 @@ async function main() {
 
   } catch (e) {
     console.error('[ERROR] 初始化失败:', e.message);
-    await notifyTelegram({
+    await notifyFeishu({
       ok: false,
       stage: '初始化',
       msg: e.message,
