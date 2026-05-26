@@ -72,10 +72,19 @@ async function sendSummaryNotification(results) {
       `失败: ${totalCount - successCount}`,
       '',
       '详细结果:',
-      ...results.map((r, index) =>
-        `${index + 1}. ${r.username}: ${r.success ? '✅ 成功' : '❌ 失败'}${r.message ? ` (${r.message})` : ''}${r.retries > 0 ? ` [重试: ${r.retries}]` : ''}`
-      ),
+      ...results.map((r, index) => {
+        const status = r.success ? '✅ 成功' : '❌ 失败';
+        const message = r.message ? ` (${r.message})` : '';
+        const retry = r.retries > 0 ? ` [重试: ${r.retries}]` : '';
+        return `${index + 1}. ${r.username}: ${status}${message}${retry}`;
+      }),
       '',
+      ...(totalCount - successCount > 0 ? [
+        '💡 失败提示：',
+        '• 如果提示人机验证，请手动登录一次后再重试',
+        '• 检查截图了解具体错误原因',
+        ''
+      ] : []),
       `时间: ${new Date().toISOString()}`
     ];
 
@@ -124,21 +133,27 @@ async function smartWait(page, condition, timeout = 30000, checkInterval = 1000)
 
 async function loginWithAccount(username, password, index) {
   console.log(`\n=== 开始处理账户 ${index + 1}: ${username} ===`);
-  
+
   let retryCount = 0;
   let result = null;
-  
+
   // 重试机制
   while (retryCount <= MAX_RETRIES && !(result?.success)) {
     if (retryCount > 0) {
       console.log(`[${username}] 🔄 第 ${retryCount} 次重试...`);
       await new Promise(resolve => setTimeout(resolve, 5000)); // 重试前等待5秒
     }
-    
+
     result = await attemptLogin(username, password, index, retryCount);
     retryCount++;
+
+    // 如果是人机验证，不继续重试（重试也没用）
+    if (result?.errorType === 'human_check') {
+      console.log(`[${username}] ⚠️ 检测到人机验证，停止重试`);
+      break;
+    }
   }
-  
+
   return { ...result, retries: retryCount - 1 };
 }
 
@@ -231,8 +246,24 @@ async function attemptLogin(username, password, index, retryCount) {
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(3000);
 
-    // 4) 判定是否登录成功
-    const spAfter = screenshot('03-after-submit');
+    // 4) 提交后再次检测人机验证（可能在登录提交后才出现）
+    const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|Turnstile|captcha|recaptcha|人机|验证/i').first();
+    if (await humanCheckAfterSubmit.count()) {
+      const sp = screenshot('03-human-check-after-submit');
+      await page.screenshot({ path: sp, fullPage: true });
+      console.log(`[${username}] ⚠️ 提交登录后检测到人机验证`);
+      await notifyFeishu({
+        ok: false,
+        stage: '登录结果',
+        msg: '🔐 触发人机验证（CAPTCHA）\n\n网站检测到自动化登录，需要人工验证。\n\n💡 建议：\n1. 手动登录一次，让网站记住设备\n2. 或在浏览器中完成验证后再重试\n3. 如果使用 VPN，尝试切换节点后重试',
+        screenshotPath: sp,
+        username
+      });
+      return { success: false, username, message: '🔐 触发人机验证，请手动登录一次后再试', errorType: 'human_check' };
+    }
+
+    // 5) 判定是否登录成功
+    const spAfter = screenshot('04-after-submit');
     await page.screenshot({ path: spAfter, fullPage: true });
 
     const url = page.url();
@@ -296,21 +327,27 @@ async function attemptLogin(username, password, index, retryCount) {
       }
     }
 
-    if (!errorMsg) {
-      // 如果没有找到明确的错误信息，检查页面标题或主要内容
+    // 如果没有找到明确的错误信息，或者错误信息太模糊，给出更友好的提示
+    if (!errorMsg || errorMsg === 'ERROR' || errorMsg.length < 3) {
+      // 检查是否有导航超时（通常意味着页面卡住，可能是人机验证）
       const pageTitle = await page.title();
       const mainContent = await page.locator('body').innerText().catch(() => '');
-      
-      if (pageTitle.includes('Error') || mainContent.includes('Error')) {
-        errorMsg = '页面显示错误状态';
+
+      if (stillOnLogin) {
+        // 仍在登录页，可能是人机验证或网络问题
+        errorMsg = '🔐 可能触发了人机验证或网络问题';
+      } else if (pageTitle.includes('Error') || mainContent.includes('Error')) {
+        errorMsg = '⚠️ 页面显示错误状态';
+      } else {
+        errorMsg = '❓ 未知原因，请检查截图';
       }
     }
 
-    console.log(`[${username}] ❌ 登录失败: ${errorMsg || '未知错误'}`);
+    console.log(`[${username}] ❌ 登录失败: ${errorMsg}`);
     await notifyFeishu({
       ok: false,
       stage: '登录结果',
-      msg: errorMsg ? `登录失败: ${errorMsg}` : '登录失败（原因未知）',
+      msg: errorMsg ? `登录失败: ${errorMsg}\n\n💡 建议：\n1. 检查账号密码是否正确\n2. 如果提示人机验证，手动登录一次后再试\n3. 查看截图了解详情` : '登录失败（原因未知）\n\n💡 建议：查看截图了解详情',
       screenshotPath: spAfter,
       username
     });
