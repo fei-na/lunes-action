@@ -5,8 +5,12 @@
 //   USERNAME_AND_PASSWORD - 包含所有账户的JSON字符串
 //   FEISHU_WEBHOOK - 飞书群机器人 Webhook 地址
 
-import { chromium } from '@playwright/test';
+import { chromium } from 'playwright-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
+
+// 启用 stealth 插件，绕过自动化检测
+chromium.use(StealthPlugin());
 
 const LOGIN_URL = 'https://ctrl.lunes.host/auth/login';
 const MAX_RETRIES = 2; // 每个账户的最大重试次数
