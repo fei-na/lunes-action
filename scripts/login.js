@@ -8,6 +8,7 @@
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
+import { detectAndSolveRecaptcha, detectAndSolveTurnstile } from './captcha.js';
 
 // 启用 stealth 插件，绕过自动化检测
 chromium.use(StealthPlugin());
@@ -151,9 +152,9 @@ async function loginWithAccount(username, password, index) {
     result = await attemptLogin(username, password, index, retryCount);
     retryCount++;
 
-    // 如果是人机验证，不继续重试（重试也没用）
-    if (result?.errorType === 'human_check') {
-      console.log(`[${username}] ⚠️ 检测到人机验证，停止重试`);
+    // 人机验证也允许重试（因为现在有自动解决能力）
+    if (result?.errorType === 'human_check' && !process.env.TWOCAPTCHA_API_KEY) {
+      console.log(`[${username}] ⚠️ 检测到人机验证且未配置 2Captcha，停止重试`);
       break;
     }
   }
@@ -184,19 +185,28 @@ async function attemptLogin(username, password, index, retryCount) {
       timeout: 60_000 
     });
 
-    // 快速检测"人机验证"页面文案
-    const humanCheckText = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|Turnstile/i').first();
-    if (await humanCheckText.count()) {
-      const sp = screenshot('01-human-check');
-      await page.screenshot({ path: sp, fullPage: true });
-      await notifyFeishu({
-        ok: false,
-        stage: '打开登录页',
-        msg: '检测到人机验证页面（Cloudflare/Turnstile），自动化已停止。',
-        screenshotPath: sp,
-        username
-      });
-      return { success: false, username, message: '人机验证页面' };
+    // 检测并尝试解决 Cloudflare Turnstile（页面级拦截）
+    const apiKey = process.env.TWOCAPTCHA_API_KEY;
+    const turnstileSolved = apiKey ? await detectAndSolveTurnstile(page, apiKey) : false;
+    if (!turnstileSolved) {
+      // 如果没有 Turnstile 或解决失败，再检查传统的人机验证文案
+      const humanCheckText = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare/i').first();
+      if (await humanCheckText.count()) {
+        if (!apiKey) {
+          const sp = screenshot('01-human-check');
+          await page.screenshot({ path: sp, fullPage: true });
+          await notifyFeishu({
+            ok: false,
+            stage: '打开登录页',
+            msg: '检测到人机验证，但未配置 TWOCAPTCHA_API_KEY，无法自动解决。',
+            screenshotPath: sp,
+            username
+          });
+          return { success: false, username, message: '人机验证页面（未配置验证码解决服务）' };
+        }
+      }
+    } else {
+      console.log(`[${username}] ✅ Turnstile 已通过 2Captcha 解决`);
     }
 
     // 2) 等待输入框可见
@@ -250,20 +260,40 @@ async function attemptLogin(username, password, index, retryCount) {
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(3000);
 
-    // 4) 提交后再次检测人机验证（可能在登录提交后才出现）
-    const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|Turnstile|captcha|recaptcha|人机|验证/i').first();
-    if (await humanCheckAfterSubmit.count()) {
+    // 4) 提交后检测 reCAPTCHA 并尝试自动解决
+    const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
+    if (recaptchaSolved) {
+      console.log(`[${username}] ✅ reCAPTCHA 已通过 2Captcha 解决，重新提交登录...`);
+      // reCAPTCHA 解决后，需要重新点击登录按钮
+      const loginBtnAfterCaptcha = page.locator('button[type="submit"], button:has-text("登录"), button:has-text("Sign in"), button:has-text("Log in")').first();
+      if (await loginBtnAfterCaptcha.count() > 0) {
+        const navPromise2 = page.waitForNavigation({
+          waitUntil: 'networkidle',
+          timeout: NAVIGATION_TIMEOUT
+        }).catch(() => null);
+        await loginBtnAfterCaptcha.click({ timeout: 10_000 });
+        await navPromise2;
+        await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+        await page.waitForTimeout(3000);
+      }
+    }
+
+    // 再次检测是否仍有人机验证（可能解决失败）
+    const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|captcha|recaptcha|人机|验证/i').first();
+    if (await humanCheckAfterSubmit.count() && !recaptchaSolved) {
       const sp = screenshot('03-human-check-after-submit');
       await page.screenshot({ path: sp, fullPage: true });
       console.log(`[${username}] ⚠️ 提交登录后检测到人机验证`);
       await notifyFeishu({
         ok: false,
         stage: '登录结果',
-        msg: '🔐 触发人机验证（CAPTCHA）\n\n网站检测到自动化登录，需要人工验证。\n\n💡 建议：\n1. 手动登录一次，让网站记住设备\n2. 或在浏览器中完成验证后再重试\n3. 如果使用 VPN，尝试切换节点后重试',
+        msg: apiKey
+          ? '🔐 触发人机验证，2Captcha 自动解决失败\n\n可能原因：验证码类型不支持或服务繁忙，请稍后重试'
+          : '🔐 触发人机验证（CAPTCHA）\n\n未配置 TWOCAPTCHA_API_KEY，无法自动解决。\n💡 请在 GitHub Secrets 中添加 TWOCAPTCHA_API_KEY',
         screenshotPath: sp,
         username
       });
-      return { success: false, username, message: '🔐 触发人机验证，请手动登录一次后再试', errorType: 'human_check' };
+      return { success: false, username, message: '🔐 触发人机验证，自动解决失败', errorType: 'human_check' };
     }
 
     // 5) 判定是否登录成功
