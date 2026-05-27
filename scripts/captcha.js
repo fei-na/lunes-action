@@ -107,52 +107,87 @@ async function pollResult(taskId, apiKey) {
  * @returns {Promise<boolean>} - 是否成功解决
  */
 export async function detectAndSolveRecaptcha(page, apiKey) {
-  // 检测 reCAPTCHA iframe
-  const recaptchaFrame = page.frameLocator('iframe[src*="recaptcha"]').first();
-  const recaptchaCheckbox = recaptchaFrame.locator('.recaptcha-checkbox-border');
+  // 检测 reCAPTCHA - 多种方式
+  const recaptchaIframeCount = await page.locator('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]').count();
+  const gRecaptchaDiv = await page.locator('.g-recaptcha, [data-sitekey]').count();
+  const gRecaptchaTextarea = await page.locator('#g-recaptcha-response, textarea[name="g-recaptcha-response"]').count();
 
-  const hasRecaptcha = await recaptchaFrame.locator('.recaptcha-checkbox').count() > 0;
+  console.log(`[CAPTCHA] 检测结果: iframe=${recaptchaIframeCount}, div=${gRecaptchaDiv}, textarea=${gRecaptchaTextarea}`);
 
-  if (!hasRecaptcha) {
-    // 尝试检测隐藏的 reCAPTCHA（有些网站把 reCAPTCHA 包在 div 里）
-    const gRecaptchaResponse = await page.locator('#g-recaptcha-response').count();
-    if (gRecaptchaResponse === 0) {
-      console.log('[CAPTCHA] 未检测到 reCAPTCHA');
-      return false;
-    }
-    console.log('[CAPTCHA] 检测到隐藏的 reCAPTCHA');
+  if (recaptchaIframeCount === 0 && gRecaptchaDiv === 0 && gRecaptchaTextarea === 0) {
+    console.log('[CAPTCHA] 未检测到 reCAPTCHA');
+    return false;
   }
 
-  // 提取 sitekey
+  // 提取 sitekey - 多种方式，带详细日志
   let siteKey = await page.evaluate(() => {
     // 方式1: 从 g-recaptcha 的 div 属性中提取
     const recaptchaDiv = document.querySelector('.g-recaptcha, [data-sitekey]');
-    if (recaptchaDiv) return recaptchaDiv.getAttribute('data-sitekey');
+    if (recaptchaDiv) {
+      const key = recaptchaDiv.getAttribute('data-sitekey');
+      if (key) return { key, method: 'data-sitekey div' };
+    }
 
     // 方式2: 从 iframe src 中提取
-    const iframe = document.querySelector('iframe[src*="recaptcha"]');
-    if (iframe) {
-      const match = iframe.src.match(/k=([^&]+)/);
-      if (match) return match[1];
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      const src = iframe.src || '';
+      if (src.includes('recaptcha') || src.includes('google.com/recaptcha')) {
+        const match = src.match(/k=([^&]+)/);
+        if (match) return { key: match[1], method: `iframe src (${src.substring(0, 80)}...)` };
+      }
     }
 
     // 方式3: 从页面 script 中提取
     const scripts = document.querySelectorAll('script');
     for (const script of scripts) {
-      const match = script.textContent?.match(/sitekey['":\s]+['"]([0-9A-Za-z_-]+)['"]/);
-      if (match) return match[1];
+      const text = script.textContent || '';
+      // 匹配各种格式: sitekey: "xxx", sitekey='xxx', "sitekey":"xxx"
+      const match = text.match(/['"]?sitekey['"]?\s*[:=]\s*['"]([0-9A-Za-z_-]{20,})['"]/);
+      if (match) return { key: match[1], method: 'script content' };
+    }
+
+    // 方式4: 从全局变量中提取
+    if (window.___grecaptcha_cfg) {
+      const cfg = window.___grecaptcha_cfg;
+      // 遍历 clients 对象查找 sitekey
+      if (cfg.clients) {
+        for (const clientId in cfg.clients) {
+          const client = cfg.clients[clientId];
+          const sitekey = findSitekeyInObject(client);
+          if (sitekey) return { key: sitekey, method: 'grecaptcha_cfg.clients' };
+        }
+      }
+    }
+
+    function findSitekeyInObject(obj, depth = 0) {
+      if (depth > 5 || !obj || typeof obj !== 'object') return null;
+      for (const key in obj) {
+        if (key === 'sitekey' && typeof obj[key] === 'string' && obj[key].length > 20) {
+          return obj[key];
+        }
+        if (typeof obj[key] === 'object') {
+          const found = findSitekeyInObject(obj[key], depth + 1);
+          if (found) return found;
+        }
+      }
+      return null;
     }
 
     return null;
   });
 
-  if (!siteKey) {
-    console.log('[CAPTCHA] 检测到 reCAPTCHA 但无法提取 sitekey，尝试从 iframe 提取...');
-    // 从 iframe src 提取
-    const iframeSrc = await page.locator('iframe[src*="recaptcha"]').first().getAttribute('src').catch(() => null);
+  if (siteKey?.key) {
+    console.log(`[CAPTCHA] 找到 siteKey: ${siteKey.key} (通过 ${siteKey.method})`);
+    siteKey = siteKey.key;
+  } else if (!siteKey) {
+    // 尝试从 Playwright 层面提取
+    console.log('[CAPTCHA] evaluate 未找到 sitekey，尝试 Playwright 层面提取...');
+    const iframeSrc = await page.locator('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]').first().getAttribute('src').catch(() => null);
     if (iframeSrc) {
       const match = iframeSrc.match(/k=([^&]+)/);
       if (match) siteKey = match[1];
+      console.log(`[CAPTCHA] 从 iframe src 提取: ${siteKey}`);
     }
   }
 
@@ -161,33 +196,81 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
     return false;
   }
 
-  console.log(`[CAPTCHA] 找到 reCAPTCHA siteKey: ${siteKey}`);
+  console.log(`[CAPTCHA] 最终 siteKey: ${siteKey}`);
 
   // 调用 2Captcha 解决
   const token = await solveRecaptchaV2(siteKey, page.url(), apiKey);
+  console.log(`[CAPTCHA] 获得 token (前20字符): ${token.substring(0, 20)}...`);
 
-  // 注入 token
-  await page.evaluate((token) => {
-    // 注入到 textarea
-    const textarea = document.getElementById('g-recaptcha-response');
-    if (textarea) {
+  // 注入 token - 多种方式确保生效
+  const injected = await page.evaluate((token) => {
+    let success = false;
+
+    // 方式1: 注入到 textarea
+    const textareas = document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]');
+    for (const textarea of textareas) {
       textarea.value = token;
-      textarea.style.display = 'block'; // 确保可见
+      textarea.innerHTML = token;
+      textarea.style.display = 'block';
+      success = true;
     }
 
-    // 尝试触发回调
+    // 方式2: 尝试通过 ___grecaptcha_cfg 触发回调
     if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
       const clients = window.___grecaptcha_cfg.clients;
-      for (const key in clients) {
-        const client = clients[key];
-        if (client?.reCaptchaV2?.callback) {
-          client.reCaptchaV2.callback(token);
+      for (const clientId in clients) {
+        try {
+          const client = clients[clientId];
+          // 递归查找 callback 函数
+          triggerCallback(client, token);
+          success = true;
+        } catch (e) {
+          // 忽略
         }
       }
     }
+
+    // 方式3: 如果有 grecaptcha 对象，尝试直接调用
+    if (window.grecaptcha) {
+      try {
+        // 尝试获取所有 widget 并设置响应
+        const widgets = document.querySelectorAll('.g-recaptcha');
+        widgets.forEach((widget, index) => {
+          try {
+            window.grecaptcha.getResponse(index); // 先检查
+          } catch (e) {
+            // 忽略
+          }
+        });
+      } catch (e) {
+        // 忽略
+      }
+    }
+
+    function triggerCallback(obj, token, depth = 0) {
+      if (depth > 8 || !obj || typeof obj !== 'object') return;
+      for (const key in obj) {
+        if (typeof obj[key] === 'function' && (key === 'callback' || key.includes('callback'))) {
+          try { obj[key](token); } catch (e) { /* 忽略 */ }
+        }
+        if (typeof obj[key] === 'object' && key !== 'prototype') {
+          triggerCallback(obj[key], token, depth + 1);
+        }
+      }
+    }
+
+    return success;
   }, token);
 
-  console.log('[CAPTCHA] Token 已注入页面');
+  console.log(`[CAPTCHA] Token 注入${injected ? '成功' : '可能未完全成功'}`);
+
+  // 验证注入结果
+  const tokenValue = await page.evaluate(() => {
+    const textarea = document.getElementById('g-recaptcha-response');
+    return textarea ? textarea.value?.substring(0, 20) : 'no textarea found';
+  });
+  console.log(`[CAPTCHA] 验证 textarea 值: ${tokenValue}`);
+
   return true;
 }
 
