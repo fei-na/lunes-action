@@ -232,53 +232,51 @@ async function attemptLogin(username, password, index, retryCount) {
     await passInput.evaluate(el => el.value = ''); // 更可靠的清空方式
     await passInput.fill(password, { timeout: 10_000 });
 
-    // 3) 点击登录按钮
+    // 3) 先解决 reCAPTCHA（按钮因验证码未通过而 disabled）
     const loginBtn = page.locator('button[type="submit"], button:has-text("登录"), button:has-text("Sign in"), button:has-text("Log in")').first();
     await loginBtn.waitFor({ state: 'visible', timeout: 15_000 });
-    
+
     const spBefore = screenshot('02-before-submit');
     await page.screenshot({ path: spBefore, fullPage: true });
 
+    // 等待 reCAPTCHA 异步加载（截图显示它是后加载的）
+    console.log(`[${username}] 等待 reCAPTCHA 加载...`);
+    await smartWait(page, async () => {
+      const iframe = await page.locator('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]').count();
+      const gDiv = await page.locator('.g-recaptcha, [data-sitekey]').count();
+      return iframe > 0 || gDiv > 0;
+    }, 20_000).catch(() => {});
+
+    console.log(`[${username}] 检测是否有 reCAPTCHA...`);
+    const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
+    if (recaptchaSolved) {
+      console.log(`[${username}] ✅ reCAPTCHA 已解决，等待按钮启用...`);
+      // 等待按钮从 disabled 变为 enabled
+      await smartWait(page, async () => {
+        return await loginBtn.isEnabled();
+      }, 30_000);
+      console.log(`[${username}] 按钮已启用`);
+    }
+
+    // 4) 点击登录按钮
     console.log(`[${username}] 提交登录...`);
-    
-    // 使用 Promise.all 同时等待导航和点击操作
-    const navigationPromise = page.waitForNavigation({ 
-      waitUntil: 'networkidle', 
-      timeout: NAVIGATION_TIMEOUT 
+
+    const navigationPromise = page.waitForNavigation({
+      waitUntil: 'networkidle',
+      timeout: NAVIGATION_TIMEOUT
     }).catch(e => {
       console.log(`[${username}] 导航等待可能超时: ${e.message}`);
-      return null; // 不抛出异常，我们会通过其他方式检查状态
+      return null;
     });
 
-    await loginBtn.click({ timeout: 10_000 });
-    
-    // 等待导航完成或超时
+    await loginBtn.click({ timeout: 15_000 });
     await navigationPromise;
-    
-    // 额外等待确保页面完全稳定
+
     console.log(`[${username}] 等待页面完全稳定...`);
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(3000);
 
-    // 4) 提交后检测 reCAPTCHA 并尝试自动解决
-    const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
-    if (recaptchaSolved) {
-      console.log(`[${username}] ✅ reCAPTCHA 已通过 2Captcha 解决，重新提交登录...`);
-      // reCAPTCHA 解决后，需要重新点击登录按钮
-      const loginBtnAfterCaptcha = page.locator('button[type="submit"], button:has-text("登录"), button:has-text("Sign in"), button:has-text("Log in")').first();
-      if (await loginBtnAfterCaptcha.count() > 0) {
-        const navPromise2 = page.waitForNavigation({
-          waitUntil: 'networkidle',
-          timeout: NAVIGATION_TIMEOUT
-        }).catch(() => null);
-        await loginBtnAfterCaptcha.click({ timeout: 10_000 });
-        await navPromise2;
-        await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-        await page.waitForTimeout(3000);
-      }
-    }
-
-    // 再次检测是否仍有人机验证（可能解决失败）
+    // 5) 再次检测是否仍有人机验证（可能解决失败或出现新的验证）
     const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|captcha|recaptcha|人机|验证/i').first();
     if (await humanCheckAfterSubmit.count() && !recaptchaSolved) {
       const sp = screenshot('03-human-check-after-submit');
