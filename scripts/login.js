@@ -239,16 +239,56 @@ async function attemptLogin(username, password, index, retryCount) {
     const spBefore = screenshot('02-before-submit');
     await page.screenshot({ path: spBefore, fullPage: true });
 
-    // 等待 reCAPTCHA 异步加载（截图显示它是后加载的）
+    // 等待 reCAPTCHA 异步加载
     console.log(`[${username}] 等待 reCAPTCHA 加载...`);
-    await smartWait(page, async () => {
-      const iframe = await page.locator('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]').count();
-      const gDiv = await page.locator('.g-recaptcha, [data-sitekey]').count();
-      return iframe > 0 || gDiv > 0;
-    }, 20_000).catch(() => {});
+    await page.waitForTimeout(5000); // 给 reCAPTCHA 足够的加载时间
+
+    // 收集页面调试信息
+    const debugInfo = await page.evaluate(() => {
+      const iframes = document.querySelectorAll('iframe');
+      const iframeSrcs = Array.from(iframes).map(f => f.src?.substring(0, 120) || 'no-src');
+      const hasGrecaptcha = !!window.grecaptcha;
+      const hasCfg = !!window.___grecaptcha_cfg;
+      const gRecaptchaDiv = document.querySelector('.g-recaptcha, [data-sitekey]');
+      const textarea = document.getElementById('g-recaptcha-response');
+      const forms = document.querySelectorAll('form');
+      const formData = Array.from(forms).map(f => ({ action: f.action, method: f.method }));
+      return {
+        iframeCount: iframes.length,
+        iframeSrcs,
+        hasGrecaptcha,
+        hasCfg,
+        gRecaptchaDiv: gRecaptchaDiv ? { tag: gRecaptchaDiv.tagName, sitekey: gRecaptchaDiv.getAttribute('data-sitekey')?.substring(0, 20) } : null,
+        textarea: textarea ? { id: textarea.id, valueLen: textarea.value?.length } : null,
+        forms: formData,
+        url: window.location.href
+      };
+    });
+    console.log(`[${username}] 页面调试信息: ${JSON.stringify(debugInfo)}`);
 
     console.log(`[${username}] 检测是否有 reCAPTCHA...`);
     const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
+
+    // 发送调试信息到飞书
+    const debugMsg = [
+      `reCAPTCHA 检测: ${recaptchaSolved ? '成功' : '未检测到/失败'}`,
+      `API Key: ${apiKey ? '已配置' : '未配置'}`,
+      `iframe 数量: ${debugInfo.iframeCount}`,
+      `iframe 列表: ${debugInfo.iframeSrcs.join(' | ')}`,
+      `grecaptcha 对象: ${debugInfo.hasGrecaptcha}`,
+      `grecaptcha_cfg: ${debugInfo.hasCfg}`,
+      `g-recaptcha div: ${JSON.stringify(debugInfo.gRecaptchaDiv)}`,
+      `textarea: ${JSON.stringify(debugInfo.textarea)}`,
+      `表单: ${JSON.stringify(debugInfo.forms)}`,
+      `URL: ${debugInfo.url}`
+    ].join('\n');
+    await notifyFeishu({
+      ok: recaptchaSolved,
+      stage: 'reCAPTCHA 检测',
+      msg: debugMsg,
+      username
+    });
+
     if (recaptchaSolved) {
       console.log(`[${username}] ✅ reCAPTCHA token 已注入`);
 
