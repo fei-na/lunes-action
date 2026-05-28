@@ -207,110 +207,142 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
   console.log(`[CAPTCHA] 最终 siteKey: ${siteKey}`);
 
   // 调用 2Captcha 解决
+  const solveStartTime = Date.now();
   const token = await solveRecaptchaV2(siteKey, page.url(), apiKey);
-  console.log(`[CAPTCHA] 获得 token (前20字符): ${token.substring(0, 20)}...`);
+  const solveTime = Date.now() - solveStartTime;
+  console.log(`[CAPTCHA] 获得 token (前20字符): ${token.substring(0, 20)}... (耗时: ${Math.round(solveTime / 1000)}s, 长度: ${token.length})`);
 
-  // 注入 token - 多种方式确保生效
-  const injected = await page.evaluate((token) => {
-    let callbackTriggered = false;
+  // 先重置 reCAPTCHA 状态（清除之前的错误状态）
+  await page.evaluate(() => {
+    try {
+      if (window.grecaptcha) {
+        // 重置所有 widget
+        const widgets = document.querySelectorAll('.g-recaptcha');
+        for (let i = 0; i < (widgets.length || 1); i++) {
+          try { window.grecaptcha.reset(i); } catch (e) { /* 忽略 */ }
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+  });
+  await page.waitForTimeout(500);
+
+  // 注入 token 并触发回调
+  const injectionResult = await page.evaluate((token) => {
+    const result = { textareaSet: false, callbackFound: null, callbackTriggered: false };
 
     // 方式1: 注入到所有 textarea
     const textareas = document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]');
     for (const textarea of textareas) {
-      textarea.value = token;
-      textarea.innerHTML = token;
-      // 触发 input/change 事件
+      // 使用 native setter 确保 React/Vue 等框架能检测到变化
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+      if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(textarea, token);
+      } else {
+        textarea.value = token;
+      }
       textarea.dispatchEvent(new Event('input', { bubbles: true }));
       textarea.dispatchEvent(new Event('change', { bubbles: true }));
+      result.textareaSet = true;
     }
 
-    // 方式2: 从 data-callback 属性获取回调函数名
-    const recaptchaDivs = document.querySelectorAll('.g-recaptcha, [data-sitekey], [data-callback]');
-    for (const div of recaptchaDivs) {
-      const callbackName = div.getAttribute('data-callback');
-      if (callbackName && typeof window[callbackName] === 'function') {
-        try {
-          window[callbackName](token);
-          callbackTriggered = true;
-        } catch (e) { /* 忽略 */ }
-      }
+    // 方式2: 查找 data-callback 属性
+    const callbackNames = [];
+    const recaptchaElements = document.querySelectorAll('[data-callback], .g-recaptcha, [data-sitekey]');
+    for (const el of recaptchaElements) {
+      const cb = el.getAttribute('data-callback');
+      if (cb) callbackNames.push(cb);
     }
 
-    // 方式3: 通过 ___grecaptcha_cfg 递归查找并触发所有回调
+    // 方式3: 从 ___grecaptcha_cfg 深度搜索所有函数
     if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
-      const clients = window.___grecaptcha_cfg.clients;
-      for (const clientId in clients) {
-        try {
-          triggerAllCallbacks(clients[clientId], token);
-          callbackTriggered = true;
-        } catch (e) { /* 忽略 */ }
+      for (const clientId in window.___grecaptcha_cfg.clients) {
+        const client = window.___grecaptcha_cfg.clients[clientId];
+        searchForCallbacks(client, callbackNames, 0);
       }
     }
 
-    // 方式4: 尝试通过 grecaptcha API
-    if (window.grecaptcha && typeof window.grecaptcha.getResponse === 'function') {
-      try {
-        // 遍历所有 widget
-        const widgetCount = document.querySelectorAll('.g-recaptcha').length || 1;
-        for (let i = 0; i < widgetCount; i++) {
-          try {
-            // 尝试 reset 然后 execute
-            window.grecaptcha.reset(i);
-          } catch (e) { /* 忽略 */ }
-        }
-      } catch (e) { /* 忽略 */ }
-    }
+    // 方式4: 常见的回调名
+    const commonNames = [
+      'onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback',
+      'onCaptchaVerified', 'verifyCallback', 'onVerify', 'captchaVerified',
+      'onRecaptcha', 'recaptchaVerified', 'grecaptchaCallback'
+    ];
+    callbackNames.push(...commonNames);
 
-    // 方式5: 查找页面上所有可能的回调函数
-    // 有些网站把回调定义在 window 上
-    const possibleCallbacks = ['onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback',
-      'onCaptchaVerified', 'verifyCallback', 'onVerify', 'captchaVerified'];
-    for (const name of possibleCallbacks) {
+    // 触发所有找到的回调
+    for (const name of callbackNames) {
       if (typeof window[name] === 'function') {
         try {
           window[name](token);
-          callbackTriggered = true;
+          result.callbackTriggered = true;
+          result.callbackFound = name;
         } catch (e) { /* 忽略 */ }
       }
     }
 
-    function triggerAllCallbacks(obj, token, depth = 0) {
+    // 方式5: 从 ___grecaptcha_cfg 中直接调用找到的函数
+    if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
+      for (const clientId in window.___grecaptcha_cfg.clients) {
+        const client = window.___grecaptcha_cfg.clients[clientId];
+        triggerCallbacksDeep(client, token, 0, result);
+      }
+    }
+
+    function searchForCallbacks(obj, names, depth) {
       if (depth > 10 || !obj || typeof obj !== 'object') return;
       for (const key in obj) {
-        if (typeof obj[key] === 'function') {
-          // 匹配各种回调名称
-          if (key === 'callback' || key.includes('Callback') || key.includes('callback') ||
-              key === 'success' || key === 'onSuccess' || key === 'resolve') {
-            try { obj[key](token); } catch (e) { /* 忽略 */ }
+        if (typeof obj[key] === 'function' && !key.startsWith('__')) {
+          // 尝试判断是否是回调函数（通过函数名或上下文）
+          if (key === 'callback' || key.includes('Callback') || key.includes('callback')) {
+            names.push(null); // 标记需要直接调用
           }
         }
         if (typeof obj[key] === 'object' && key !== 'prototype' && key !== '__proto__') {
-          triggerAllCallbacks(obj[key], token, depth + 1);
+          searchForCallbacks(obj[key], names, depth + 1);
         }
       }
     }
 
-    return callbackTriggered;
+    function triggerCallbacksDeep(obj, token, depth, result) {
+      if (depth > 12 || !obj || typeof obj !== 'object') return;
+      for (const key in obj) {
+        if (typeof obj[key] === 'function' && !key.startsWith('__')) {
+          if (key === 'callback' || key.includes('Callback') || key.includes('callback') ||
+              key === 'success' || key === 'onSuccess') {
+            try {
+              obj[key](token);
+              result.callbackTriggered = true;
+              result.callbackFound = `obj.${key}`;
+            } catch (e) { /* 忽略 */ }
+          }
+        }
+        if (typeof obj[key] === 'object' && key !== 'prototype' && key !== '__proto__') {
+          triggerCallbacksDeep(obj[key], token, depth + 1, result);
+        }
+      }
+    }
+
+    return result;
   }, token);
 
-  console.log(`[CAPTCHA] 回调触发: ${injected ? '成功' : '未找到回调'}`);
+  console.log(`[CAPTCHA] 注入结果: textarea=${injectionResult.textareaSet}, 回调=${injectionResult.callbackFound || '未找到'}, 触发=${injectionResult.callbackTriggered}`);
 
   // 验证注入结果
   const verifyResult = await page.evaluate(() => {
     const textarea = document.getElementById('g-recaptcha-response');
-    const textareaValue = textarea ? textarea.value?.substring(0, 30) : 'no textarea';
-    // 检查 grecaptcha.getResponse
+    const textareaLen = textarea ? textarea.value?.length : 0;
     let grecaptchaResponse = 'no grecaptcha';
     try {
       if (window.grecaptcha) {
-        grecaptchaResponse = window.grecaptcha.getResponse(0)?.substring(0, 30) || 'empty';
+        const resp = window.grecaptcha.getResponse(0);
+        grecaptchaResponse = resp ? `ok(${resp.length} chars)` : 'empty';
       }
     } catch (e) {
       grecaptchaResponse = `error: ${e.message}`;
     }
-    return { textareaValue, grecaptchaResponse };
+    return { textareaLen, grecaptchaResponse };
   });
-  console.log(`[CAPTCHA] 验证 - textarea: ${verifyResult.textareaValue}, grecaptcha: ${verifyResult.grecaptchaResponse}`);
+  console.log(`[CAPTCHA] 验证 - textarea长度: ${verifyResult.textareaLen}, grecaptcha: ${verifyResult.grecaptchaResponse}`);
 
   return true;
 }

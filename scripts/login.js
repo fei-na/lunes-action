@@ -250,28 +250,59 @@ async function attemptLogin(username, password, index, retryCount) {
     console.log(`[${username}] 检测是否有 reCAPTCHA...`);
     const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
     if (recaptchaSolved) {
-      console.log(`[${username}] ✅ reCAPTCHA token 已注入，尝试关闭挑战弹窗...`);
-      // 关闭 reCAPTCHA 挑战弹窗（如果有的话）
+      console.log(`[${username}] ✅ reCAPTCHA token 已注入`);
+
+      // 等待一下让回调处理完成
+      await page.waitForTimeout(2000);
+
+      // 检查 reCAPTCHA 是否真的被标记为已解决
+      const isSolved = await page.evaluate(() => {
+        try {
+          if (window.grecaptcha) {
+            const response = window.grecaptcha.getResponse(0);
+            if (response && response.length > 0) return { solved: true, len: response.length };
+          }
+        } catch (e) { /* 忽略 */ }
+        const textarea = document.getElementById('g-recaptcha-response');
+        if (textarea && textarea.value && textarea.value.length > 0) {
+          return { solved: true, len: textarea.value.length, source: 'textarea' };
+        }
+        return { solved: false };
+      });
+      console.log(`[${username}] reCAPTCHA 解决状态: ${JSON.stringify(isSolved)}`);
+
+      // 关闭 reCAPTCHA 挑战弹窗（遮罩层）
       await page.evaluate(() => {
-        // 移除 reCAPTCHA challenge 的遮罩层
         const challenges = document.querySelectorAll('iframe[title*="recaptcha challenge"]');
         challenges.forEach(iframe => {
-          const parent = iframe.closest('div');
-          if (parent) parent.style.display = 'none';
-        });
-        // 也尝试移除可能的遮罩
-        const overlays = document.querySelectorAll('[class*="overlay"], [class*="modal"]');
-        overlays.forEach(el => {
-          if (el.querySelector('iframe[src*="recaptcha"]')) {
-            el.style.display = 'none';
+          let el = iframe;
+          // 向上找到包含 iframe 的容器并隐藏
+          for (let i = 0; i < 5; i++) {
+            if (el.parentElement && el.parentElement !== document.body) {
+              el = el.parentElement;
+              if (el.style) el.style.display = 'none';
+            }
           }
         });
       });
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(500);
     }
 
-    // 4) 提交登录 - 优先用 JS 提交表单（绕过 reCAPTCHA 遮挡问题）
+    // 4) 提交登录
     console.log(`[${username}] 提交登录...`);
+
+    // 先检查 form 的 action 和 method
+    const formInfo = await page.evaluate(() => {
+      const form = document.querySelector('form');
+      if (!form) return { hasForm: false };
+      return {
+        hasForm: true,
+        action: form.action,
+        method: form.method,
+        hasSubmitEvent: !!form.onsubmit
+      };
+    });
+    console.log(`[${username}] 表单信息: ${JSON.stringify(formInfo)}`);
 
     const navigationPromise = page.waitForNavigation({
       waitUntil: 'networkidle',
@@ -281,7 +312,7 @@ async function attemptLogin(username, password, index, retryCount) {
       return null;
     });
 
-    // 方式1: 尝试直接点击按钮
+    // 方式1: 尝试直接点击按钮（force 绕过遮挡）
     let clicked = false;
     try {
       await loginBtn.click({ timeout: 5_000, force: true });
@@ -295,15 +326,14 @@ async function attemptLogin(username, password, index, retryCount) {
     if (!clicked) {
       console.log(`[${username}] 尝试 JS 直接提交表单...`);
       await page.evaluate(() => {
-        // 找到 form 并提交
         const form = document.querySelector('form');
         if (form) {
+          // 创建并触发表单提交事件
+          const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+          form.dispatchEvent(submitEvent);
+          // 也直接调用 submit
           form.submit();
-          return;
         }
-        // 如果没有 form，尝试触发按钮的 click 事件
-        const btn = document.querySelector('button[type="submit"]');
-        if (btn) btn.click();
       });
     }
 
