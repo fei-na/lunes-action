@@ -185,7 +185,7 @@ async function loginWithAccount(username, password, index) {
 }
 
 async function attemptLogin(username, password, index, retryCount) {
-  const OVERALL_TIMEOUT = 120_000; // 2 分钟整体超时
+  const OVERALL_TIMEOUT = 240_000; // 4 分钟整体超时
 
   // 包装整体超时
   return Promise.race([

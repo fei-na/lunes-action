@@ -3,7 +3,7 @@
 
 const TWOCAPTCHA_API_BASE = 'http://2captcha.com';
 const POLL_INTERVAL = 5000; // 轮询间隔 5 秒
-const MAX_WAIT_TIME = 90_000; // 最大等待 90 秒
+const MAX_WAIT_TIME = 180_000; // 最大等待 3 分钟
 
 /**
  * 通过 2Captcha 解决 reCAPTCHA v2
@@ -82,22 +82,39 @@ async function pollResult(taskId, apiKey) {
     resultUrl.searchParams.set('id', taskId);
     resultUrl.searchParams.set('json', '1');
 
-    const resultRes = await fetch(resultUrl.toString());
-    const resultData = await resultRes.json();
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    console.log(`[CAPTCHA] 轮询结果... (${elapsed}s, taskId: ${taskId})`);
 
-    if (resultData.status === 1) {
-      console.log(`[CAPTCHA] 解决成功! 耗时 ${Math.round((Date.now() - startTime) / 1000)}s`);
-      return resultData.request;
-    }
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15_000); // 15秒单次请求超时
+      const resultRes = await fetch(resultUrl.toString(), { signal: controller.signal });
+      clearTimeout(timeout);
+      const resultData = await resultRes.json();
 
-    if (resultData.request !== 'CAPCHA_NOT_READY') {
+      if (resultData.status === 1) {
+        console.log(`[CAPTCHA] 解决成功! 耗时 ${elapsed}s`);
+        return resultData.request;
+      }
+
+      if (resultData.request === 'CAPCHA_NOT_READY') {
+        console.log(`[CAPTCHA] 结果未就绪，继续等待...`);
+        continue;
+      }
+
+      // 其他错误（如 ERROR_CAPTCHA_UNSOLVABLE, ERROR_ZERO_BALANCE 等）
+      console.log(`[CAPTCHA] API 返回错误: ${resultData.request}`);
       throw new Error(`2Captcha 查询失败: ${resultData.request}`);
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        console.log(`[CAPTCHA] 单次请求超时 (${elapsed}s)，重试...`);
+        continue;
+      }
+      throw e;
     }
-
-    console.log(`[CAPTCHA] 等待中... (${Math.round((Date.now() - startTime) / 1000)}s)`);
   }
 
-  throw new Error('2Captcha 超时（5分钟未返回结果）');
+  throw new Error(`2Captcha 超时（${Math.round(MAX_WAIT_TIME / 1000)}秒未返回结果）`);
 }
 
 /**
