@@ -250,15 +250,27 @@ async function attemptLogin(username, password, index, retryCount) {
     console.log(`[${username}] 检测是否有 reCAPTCHA...`);
     const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
     if (recaptchaSolved) {
-      console.log(`[${username}] ✅ reCAPTCHA 已解决，等待按钮启用...`);
-      // 等待按钮从 disabled 变为 enabled
-      await smartWait(page, async () => {
-        return await loginBtn.isEnabled();
-      }, 30_000);
-      console.log(`[${username}] 按钮已启用`);
+      console.log(`[${username}] ✅ reCAPTCHA token 已注入，尝试关闭挑战弹窗...`);
+      // 关闭 reCAPTCHA 挑战弹窗（如果有的话）
+      await page.evaluate(() => {
+        // 移除 reCAPTCHA challenge 的遮罩层
+        const challenges = document.querySelectorAll('iframe[title*="recaptcha challenge"]');
+        challenges.forEach(iframe => {
+          const parent = iframe.closest('div');
+          if (parent) parent.style.display = 'none';
+        });
+        // 也尝试移除可能的遮罩
+        const overlays = document.querySelectorAll('[class*="overlay"], [class*="modal"]');
+        overlays.forEach(el => {
+          if (el.querySelector('iframe[src*="recaptcha"]')) {
+            el.style.display = 'none';
+          }
+        });
+      });
+      await page.waitForTimeout(1000);
     }
 
-    // 4) 点击登录按钮
+    // 4) 提交登录 - 优先用 JS 提交表单（绕过 reCAPTCHA 遮挡问题）
     console.log(`[${username}] 提交登录...`);
 
     const navigationPromise = page.waitForNavigation({
@@ -269,7 +281,32 @@ async function attemptLogin(username, password, index, retryCount) {
       return null;
     });
 
-    await loginBtn.click({ timeout: 15_000 });
+    // 方式1: 尝试直接点击按钮
+    let clicked = false;
+    try {
+      await loginBtn.click({ timeout: 5_000, force: true });
+      clicked = true;
+      console.log(`[${username}] 通过按钮点击提交`);
+    } catch (e) {
+      console.log(`[${username}] 按钮点击失败: ${e.message}`);
+    }
+
+    // 方式2: 如果按钮点击失败，用 JS 直接提交表单
+    if (!clicked) {
+      console.log(`[${username}] 尝试 JS 直接提交表单...`);
+      await page.evaluate(() => {
+        // 找到 form 并提交
+        const form = document.querySelector('form');
+        if (form) {
+          form.submit();
+          return;
+        }
+        // 如果没有 form，尝试触发按钮的 click 事件
+        const btn = document.querySelector('button[type="submit"]');
+        if (btn) btn.click();
+      });
+    }
+
     await navigationPromise;
 
     console.log(`[${username}] 等待页面完全稳定...`);
