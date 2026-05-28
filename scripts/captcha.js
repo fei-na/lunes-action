@@ -3,7 +3,7 @@
 
 const TWOCAPTCHA_API_BASE = 'http://2captcha.com';
 const POLL_INTERVAL = 5000; // 轮询间隔 5 秒
-const MAX_WAIT_TIME = 300_000; // 最大等待 5 分钟
+const MAX_WAIT_TIME = 90_000; // 最大等待 90 秒
 
 /**
  * 通过 2Captcha 解决 reCAPTCHA v2

@@ -139,30 +139,64 @@ async function smartWait(page, condition, timeout = 30000, checkInterval = 1000)
 async function loginWithAccount(username, password, index) {
   console.log(`\n=== 开始处理账户 ${index + 1}: ${username} ===`);
 
-  let retryCount = 0;
-  let result = null;
+  try {
+    let retryCount = 0;
+    let result = null;
 
-  // 重试机制
-  while (retryCount <= MAX_RETRIES && !(result?.success)) {
-    if (retryCount > 0) {
-      console.log(`[${username}] 🔄 第 ${retryCount} 次重试...`);
-      await new Promise(resolve => setTimeout(resolve, 5000)); // 重试前等待5秒
+    // 重试机制
+    while (retryCount <= MAX_RETRIES && !(result?.success)) {
+      if (retryCount > 0) {
+        console.log(`[${username}] 🔄 第 ${retryCount} 次重试...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+
+      try {
+        result = await attemptLogin(username, password, index, retryCount);
+      } catch (e) {
+        console.error(`[${username}] 尝试 ${retryCount} 异常: ${e.message}`);
+        result = { success: false, username, message: `异常: ${e.message}` };
+        // 确保发送飞书通知
+        await notifyFeishu({
+          ok: false,
+          stage: '异常',
+          msg: `尝试 ${retryCount + 1} 失败: ${e.message}`,
+          username
+        });
+      }
+      retryCount++;
+
+      if (result?.errorType === 'human_check' && !process.env.TWOCAPTCHA_API_KEY) {
+        break;
+      }
     }
 
-    result = await attemptLogin(username, password, index, retryCount);
-    retryCount++;
-
-    // 人机验证也允许重试（因为现在有自动解决能力）
-    if (result?.errorType === 'human_check' && !process.env.TWOCAPTCHA_API_KEY) {
-      console.log(`[${username}] ⚠️ 检测到人机验证且未配置 2Captcha，停止重试`);
-      break;
-    }
+    return { ...result, retries: retryCount - 1 };
+  } catch (e) {
+    // 最外层兜底
+    console.error(`[${username}] 致命错误: ${e.message}`);
+    await notifyFeishu({
+      ok: false,
+      stage: '致命错误',
+      msg: e.message,
+      username
+    }).catch(() => {});
+    return { success: false, username, message: `致命错误: ${e.message}`, retries: 0 };
   }
-
-  return { ...result, retries: retryCount - 1 };
 }
 
 async function attemptLogin(username, password, index, retryCount) {
+  const OVERALL_TIMEOUT = 120_000; // 2 分钟整体超时
+
+  // 包装整体超时
+  return Promise.race([
+    attemptLoginCore(username, password, index, retryCount),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('整体超时（2分钟）')), OVERALL_TIMEOUT)
+    )
+  ]);
+}
+
+async function attemptLoginCore(username, password, index, retryCount) {
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
@@ -172,7 +206,7 @@ async function attemptLogin(username, password, index, retryCount) {
     viewport: { width: 1366, height: 768 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
   });
-  
+
   const page = await context.newPage();
 
   const screenshot = (name) => `./${name}-${index}-${username.replace(/[@.]/g, '_')}${retryCount > 0 ? `-retry${retryCount}` : ''}.png`;
@@ -180,9 +214,9 @@ async function attemptLogin(username, password, index, retryCount) {
   try {
     // 1) 打开登录页
     console.log(`[${username}] 打开登录页...`);
-    await page.goto(LOGIN_URL, { 
-      waitUntil: 'domcontentloaded', 
-      timeout: 60_000 
+    await page.goto(LOGIN_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30_000
     });
 
     // 检测并尝试解决 Cloudflare Turnstile（页面级拦截）
@@ -241,7 +275,7 @@ async function attemptLogin(username, password, index, retryCount) {
 
     // 等待 reCAPTCHA 异步加载
     console.log(`[${username}] 等待 reCAPTCHA 加载...`);
-    await page.waitForTimeout(5000); // 给 reCAPTCHA 足够的加载时间
+    await page.waitForTimeout(3000);
 
     // 收集页面调试信息
     const debugInfo = await page.evaluate(() => {
