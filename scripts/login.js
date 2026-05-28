@@ -14,7 +14,7 @@ import { detectAndSolveRecaptcha, detectAndSolveTurnstile } from './captcha.js';
 chromium.use(StealthPlugin());
 
 const LOGIN_URL = 'https://ctrl.lunes.host/auth/login';
-const MAX_RETRIES = 2; // 每个账户的最大重试次数
+const MAX_RETRIES = 0; // 每个账户的最大重试次数（调试阶段先关闭）
 const NAVIGATION_TIMEOUT = 60_000; // 导航超时时间（60秒）
 const DEFAULT_WAIT_TIME = 5000; // 默认等待时间（5秒）
 
@@ -343,22 +343,39 @@ async function attemptLogin(username, password, index, retryCount) {
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(3000);
 
-    // 5) 再次检测是否仍有人机验证（可能解决失败或出现新的验证）
-    const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|captcha|recaptcha|人机|验证/i').first();
-    if (await humanCheckAfterSubmit.count() && !recaptchaSolved) {
+    // 5) 再次检测是否仍有人机验证
+    const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|captcha|recaptcha|人机|验证|did not render/i').first();
+    const pageContent = await page.locator('body').innerText().catch(() => '');
+    const currentUrl = page.url();
+    const hasHumanCheck = await humanCheckAfterSubmit.count() > 0;
+    const hasRenderError = pageContent.includes('did not render');
+
+    if ((hasHumanCheck || hasRenderError) && !recaptchaSolved) {
       const sp = screenshot('03-human-check-after-submit');
       await page.screenshot({ path: sp, fullPage: true });
-      console.log(`[${username}] ⚠️ 提交登录后检测到人机验证`);
       await notifyFeishu({
         ok: false,
         stage: '登录结果',
         msg: apiKey
-          ? '🔐 触发人机验证，2Captcha 自动解决失败\n\n可能原因：验证码类型不支持或服务繁忙，请稍后重试'
-          : '🔐 触发人机验证（CAPTCHA）\n\n未配置 TWOCAPTCHA_API_KEY，无法自动解决。\n💡 请在 GitHub Secrets 中添加 TWOCAPTCHA_API_KEY',
+          ? `🔐 人机验证未解决\n\nURL: ${currentUrl}\n检测到验证: ${hasHumanCheck}\n渲染错误: ${hasRenderError}`
+          : '🔐 未配置 TWOCAPTCHA_API_KEY',
         screenshotPath: sp,
         username
       });
       return { success: false, username, message: '🔐 触发人机验证，自动解决失败', errorType: 'human_check' };
+    }
+
+    if (hasRenderError && recaptchaSolved) {
+      const sp = screenshot('03-render-error');
+      await page.screenshot({ path: sp, fullPage: true });
+      await notifyFeishu({
+        ok: false,
+        stage: '登录结果',
+        msg: `🔐 reCAPTCHA 渲染错误（token 注入后）\n\nURL: ${currentUrl}\n\n这通常意味着：\n1. 服务器拒绝了 2Captcha 的 token\n2. token 已过期\n3. reCAPTCHA 回调未正确触发`,
+        screenshotPath: sp,
+        username
+      });
+      return { success: false, username, message: 'reCAPTCHA 渲染错误', errorType: 'human_check' };
     }
 
     // 5) 判定是否登录成功

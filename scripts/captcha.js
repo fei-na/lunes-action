@@ -205,6 +205,7 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
   }
 
   console.log(`[CAPTCHA] 最终 siteKey: ${siteKey}`);
+  console.log(`[CAPTCHA] 页面 URL: ${page.url()}`);
 
   // 调用 2Captcha 解决
   const solveStartTime = Date.now();
@@ -289,37 +290,51 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
     }
 
     function searchForCallbacks(obj, names, depth) {
-      if (depth > 10 || !obj || typeof obj !== 'object') return;
-      for (const key in obj) {
-        if (typeof obj[key] === 'function' && !key.startsWith('__')) {
-          // 尝试判断是否是回调函数（通过函数名或上下文）
-          if (key === 'callback' || key.includes('Callback') || key.includes('callback')) {
-            names.push(null); // 标记需要直接调用
-          }
+      if (depth > 8 || !obj || typeof obj !== 'object') return;
+      // 跳过浏览器安全限制的对象
+      const skipTypes = ['CSSStyleSheet', 'CSSStyleDeclaration', 'CSSRule', 'CSSRuleList',
+        'StyleSheet', 'StyleSheetList', 'DOMStringMap', 'NamedNodeMap', 'DOMTokenList'];
+      if (obj.constructor && skipTypes.includes(obj.constructor.name)) return;
+      try {
+        for (const key in obj) {
+          try {
+            if (typeof obj[key] === 'function' && !key.startsWith('__')) {
+              if (key === 'callback' || key.includes('Callback') || key.includes('callback')) {
+                names.push(null); // 标记需要直接调用
+              }
+            }
+            if (typeof obj[key] === 'object' && obj[key] !== null && key !== 'prototype' && key !== '__proto__') {
+              searchForCallbacks(obj[key], names, depth + 1);
+            }
+          } catch (e) { /* 跳过不可访问的属性 */ }
         }
-        if (typeof obj[key] === 'object' && key !== 'prototype' && key !== '__proto__') {
-          searchForCallbacks(obj[key], names, depth + 1);
-        }
-      }
+      } catch (e) { /* 跳过不可枚举的对象 */ }
     }
 
     function triggerCallbacksDeep(obj, token, depth, result) {
-      if (depth > 12 || !obj || typeof obj !== 'object') return;
-      for (const key in obj) {
-        if (typeof obj[key] === 'function' && !key.startsWith('__')) {
-          if (key === 'callback' || key.includes('Callback') || key.includes('callback') ||
-              key === 'success' || key === 'onSuccess') {
-            try {
-              obj[key](token);
-              result.callbackTriggered = true;
-              result.callbackFound = `obj.${key}`;
-            } catch (e) { /* 忽略 */ }
-          }
+      if (depth > 8 || !obj || typeof obj !== 'object') return;
+      const skipTypes = ['CSSStyleSheet', 'CSSStyleDeclaration', 'CSSRule', 'CSSRuleList',
+        'StyleSheet', 'StyleSheetList', 'DOMStringMap', 'NamedNodeMap', 'DOMTokenList'];
+      if (obj.constructor && skipTypes.includes(obj.constructor.name)) return;
+      try {
+        for (const key in obj) {
+          try {
+            if (typeof obj[key] === 'function' && !key.startsWith('__')) {
+              if (key === 'callback' || key.includes('Callback') || key.includes('callback') ||
+                  key === 'success' || key === 'onSuccess') {
+                try {
+                  obj[key](token);
+                  result.callbackTriggered = true;
+                  result.callbackFound = `obj.${key}`;
+                } catch (e) { /* 忽略 */ }
+              }
+            }
+            if (typeof obj[key] === 'object' && obj[key] !== null && key !== 'prototype' && key !== '__proto__') {
+              triggerCallbacksDeep(obj[key], token, depth + 1, result);
+            }
+          } catch (e) { /* 跳过不可访问的属性 */ }
         }
-        if (typeof obj[key] === 'object' && key !== 'prototype' && key !== '__proto__') {
-          triggerCallbacksDeep(obj[key], token, depth + 1, result);
-        }
-      }
+      } catch (e) { /* 跳过不可枚举的对象 */ }
     }
 
     return result;
