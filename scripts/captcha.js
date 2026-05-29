@@ -121,44 +121,26 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
     return false;
   }
 
-  // 提取 sitekey
+  // 提取 sitekey — 只用简单方式，避免深度遍历
   let siteKey = await page.evaluate(() => {
+    // data-sitekey div
     const div = document.querySelector('.g-recaptcha, [data-sitekey]');
-    if (div?.getAttribute('data-sitekey')) return { key: div.getAttribute('data-sitekey'), m: 'div' };
+    if (div?.getAttribute('data-sitekey')) return div.getAttribute('data-sitekey');
 
+    // iframe src
     for (const f of document.querySelectorAll('iframe')) {
       if (f.src?.includes('recaptcha')) {
         const m = f.src.match(/k=([^&]+)/);
-        if (m) return { key: m[1], m: 'iframe' };
+        if (m) return m[1];
       }
     }
 
-    for (const s of document.querySelectorAll('script')) {
-      const m = s.textContent?.match(/['"]?sitekey['"]?\s*[:=]\s*['"]([0-9A-Za-z_-]{20,})['"]/);
-      if (m) return { key: m[1], m: 'script' };
-    }
-
-    if (window.___grecaptcha_cfg?.clients) {
-      for (const id in window.___grecaptcha_cfg.clients) {
-        const k = findKey(window.___grecaptcha_cfg.clients[id], 0);
-        if (k) return { key: k, m: 'cfg' };
-      }
-    }
-
-    function findKey(o, d) {
-      if (d > 5 || !o || typeof o !== 'object') return null;
-      for (const k in o) {
-        if (k === 'sitekey' && typeof o[k] === 'string' && o[k].length > 20) return o[k];
-        if (typeof o[k] === 'object') { const f = findKey(o[k], d + 1); if (f) return f; }
-      }
-      return null;
-    }
     return null;
   });
 
-  if (siteKey?.key) {
-    siteKey = siteKey.key;
-  } else if (!siteKey) {
+  if (siteKey) {
+    console.log(`[CAPTCHA] siteKey: ${siteKey}`);
+  } else {
     const count = await page.locator('iframe[src*="recaptcha"], iframe[src*="recaptcha.net"]').count();
     for (let i = 0; i < count; i++) {
       const src = await page.locator('iframe[src*="recaptcha"], iframe[src*="recaptcha.net"]').nth(i).getAttribute('src').catch(() => null);
@@ -182,58 +164,44 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
   await page.evaluate(() => { try { window.grecaptcha?.reset(0); } catch (e) {} });
   await page.waitForTimeout(500);
 
-  // 注入 token
+  // 注入 token — 简单直接，避免深度遍历卡死
   const r = await page.evaluate((token) => {
-    const result = { ta: false, cb: null, cbOk: false };
+    const result = { ta: false, cb: null };
 
-    for (const ta of document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]')) {
-      const s = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-      s ? s.call(ta, token) : (ta.value = token);
+    // 1. 设置 textarea
+    const ta = document.getElementById('g-recaptcha-response');
+    if (ta) {
+      ta.value = token;
       ta.dispatchEvent(new Event('input', { bubbles: true }));
       ta.dispatchEvent(new Event('change', { bubbles: true }));
       result.ta = true;
     }
 
-    // data-callback
-    const cbs = [];
+    // 2. 查找 data-callback 并触发
     for (const el of document.querySelectorAll('[data-callback]')) {
-      const c = el.getAttribute('data-callback');
-      if (c) cbs.push(c);
-    }
-    cbs.push('onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback', 'onCaptchaVerified', 'verifyCallback', 'onVerify');
-
-    // ___grecaptcha_cfg
-    if (window.___grecaptcha_cfg?.clients) {
-      for (const id in window.___grecaptcha_cfg.clients) {
-        trigDeep(window.___grecaptcha_cfg.clients[id], token, 0, result);
+      const name = el.getAttribute('data-callback');
+      if (name && typeof window[name] === 'function') {
+        try { window[name](token); result.cb = name; } catch (e) {}
       }
     }
 
-    for (const n of cbs) {
-      if (n && typeof window[n] === 'function') {
-        try { window[n](token); result.cbOk = true; result.cb = n; } catch (e) {}
+    // 3. 尝试常见回调名
+    if (!result.cb) {
+      const names = ['onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback',
+        'verifyCallback', 'onVerify', 'captchaVerified'];
+      for (const n of names) {
+        if (typeof window[n] === 'function') {
+          try { window[n](token); result.cb = n; break; } catch (e) {}
+        }
       }
-    }
-
-    function trigDeep(o, t, d, r) {
-      if (d > 8 || !o || typeof o !== 'object') return;
-      const sk = ['CSSStyleSheet', 'CSSStyleDeclaration', 'CSSRule'];
-      if (o.constructor?.name && sk.includes(o.constructor.name)) return;
-      try { for (const k in o) {
-        try {
-          if (typeof o[k] === 'function' && (k === 'callback' || k.includes('allback'))) {
-            try { o[k](t); r.cbOk = true; r.cb = `obj.${k}`; } catch (e) {}
-          }
-          if (typeof o[k] === 'object' && o[k] !== null) trigDeep(o[k], t, d + 1, r);
-        } catch (e) {}
-      }} catch (e) {}
     }
 
     return result;
   }, token);
 
-  console.log(`[CAPTCHA] 注入: ta=${r.ta}, cb=${r.cb || '无'}, cbOk=${r.cbOk}`);
+  console.log(`[CAPTCHA] 注入: ta=${r.ta}, cb=${r.cb || '无'}`);
 
+  // 验证
   const v = await page.evaluate(() => {
     const ta = document.getElementById('g-recaptcha-response');
     let gr = 'no';
