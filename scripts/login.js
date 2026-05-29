@@ -376,44 +376,96 @@ async function attemptLoginCore(username, password, index, retryCount) {
     });
     console.log(`[${username}] 表单信息: ${JSON.stringify(formInfo)}`);
 
-    const navigationPromise = page.waitForNavigation({
-      waitUntil: 'networkidle',
-      timeout: NAVIGATION_TIMEOUT
-    }).catch(e => {
-      console.log(`[${username}] 导航等待可能超时: ${e.message}`);
-      return null;
-    });
+    // 设置网络监听（在点击之前！）
+    let loginApiCall = null;
+    const allResponses = [];
+    const responseHandler = async (response) => {
+      const url = response.url();
+      try {
+        const status = response.status();
+        let body = '';
+        try { body = await response.text(); } catch {}
+        allResponses.push({ url: url.substring(0, 150), status, body: body.substring(0, 300) });
+        // 记录任何看起来像登录 API 的请求
+        if (url.includes('/auth') || url.includes('/login') || url.includes('/api') || url.includes('/token') || url.includes('/session')) {
+          console.log(`[${username}] API 响应: ${url} (${status}) ${body.substring(0, 200)}`);
+          loginApiCall = { url, status, body: body.substring(0, 500) };
+        }
+      } catch {}
+    };
+    page.on('response', responseHandler);
 
-    // 方式1: 尝试直接点击按钮（force 绕过遮挡）
-    let clicked = false;
+    // 也拦截请求，看发送了什么参数
+    let loginRequest = null;
+    const requestHandler = (request) => {
+      const url = request.url();
+      if (url.includes('/auth') || url.includes('/login') || url.includes('/api') || url.includes('/token') || url.includes('/session')) {
+        const postData = request.postData() || '';
+        console.log(`[${username}] API 请求: ${request.method()} ${url} body=${postData.substring(0, 300)}`);
+        loginRequest = { method: request.method(), url, body: postData.substring(0, 500) };
+      }
+    };
+    page.on('request', requestHandler);
+
+    // 点击登录按钮
+    console.log(`[${username}] 点击登录按钮...`);
     try {
       await loginBtn.click({ timeout: 5_000, force: true });
-      clicked = true;
-      console.log(`[${username}] 通过按钮点击提交`);
+      console.log(`[${username}] 按钮点击完成`);
     } catch (e) {
       console.log(`[${username}] 按钮点击失败: ${e.message}`);
     }
 
-    // 方式2: 如果按钮点击失败，用 JS 直接提交表单
-    if (!clicked) {
-      console.log(`[${username}] 尝试 JS 直接提交表单...`);
+    // 等待可能的 API 响应
+    await page.waitForTimeout(8000);
+    const urlAfterClick = page.url();
+    console.log(`[${username}] 点击后 URL: ${urlAfterClick}`);
+
+    // 如果还在登录页且没捕获到 API 调用，尝试 JS 方式触发表单提交
+    if (/\/auth\/login/i.test(urlAfterClick) && !loginApiCall) {
+      console.log(`[${username}] 未检测到 API 调用，尝试 JS 触发...`);
       await page.evaluate(() => {
         const form = document.querySelector('form');
         if (form) {
-          // 创建并触发表单提交事件
-          const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
-          form.dispatchEvent(submitEvent);
-          // 也直接调用 submit
-          form.submit();
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
         }
       });
+      await page.waitForTimeout(5000);
     }
 
-    await navigationPromise;
+    // 移除监听器
+    page.off('response', responseHandler);
+    page.off('request', requestHandler);
 
-    console.log(`[${username}] 等待页面完全稳定...`);
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(3000);
+    // 打印所有捕获到的响应（用于调试）
+    console.log(`[${username}] 共捕获 ${allResponses.length} 个响应`);
+    const relevantResponses = allResponses.filter(r =>
+      !r.url.includes('google.com/recaptcha') &&
+      !r.url.includes('gstatic.com') &&
+      !r.url.includes('.js') && !r.url.includes('.css') &&
+      !r.url.includes('favicon')
+    );
+    for (const r of relevantResponses) {
+      console.log(`[${username}] 响应: ${r.status} ${r.url} body=${r.body.substring(0, 100)}`);
+    }
+
+    // 飞书发送调试信息
+    const apiDebugMsg = [
+      `点击后 URL: ${urlAfterClick}`,
+      `登录 API 请求: ${loginRequest ? JSON.stringify(loginRequest) : '无'}`,
+      `登录 API 响应: ${loginApiCall ? JSON.stringify(loginApiCall) : '无'}`,
+      `总响应数: ${allResponses.length}`,
+      `相关响应: ${relevantResponses.map(r => `${r.status} ${r.url}`).join('\n')}`
+    ].join('\n');
+    await notifyFeishu({
+      ok: !!loginApiCall,
+      stage: 'API 调试',
+      msg: apiDebugMsg,
+      username
+    });
+
+    await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+    await page.waitForTimeout(2000);
 
     // 5) 再次检测是否仍有人机验证
     const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|captcha|recaptcha|人机|验证|did not render/i').first();
