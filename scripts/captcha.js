@@ -160,13 +160,13 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
   // 调用 2Captcha
   const token = await solveRecaptchaV2(siteKey, page.url(), apiKey);
 
-  // 重置
-  await page.evaluate(() => { try { window.grecaptcha?.reset(0); } catch (e) {} });
-  await page.waitForTimeout(500);
+  // 重置 reCAPTCHA 内部状态（不清 textarea）
+  try { window.grecaptcha?.reset(0); } catch (e) {}
+  await new Promise(r => setTimeout(r, 500));
 
-  // 注入 token — 简单直接，避免深度遍历卡死
+  // 注入 token
   const r = await page.evaluate((token) => {
-    const result = { ta: false, cb: null };
+    const result = { ta: false, cb: null, getRes: null, override: false };
 
     // 1. 设置 textarea
     const ta = document.getElementById('g-recaptcha-response');
@@ -177,31 +177,90 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
       result.ta = true;
     }
 
-    // 2. 查找 data-callback 并触发
-    for (const el of document.querySelectorAll('[data-callback]')) {
-      const name = el.getAttribute('data-callback');
-      if (name && typeof window[name] === 'function') {
-        try { window[name](token); result.cb = name; } catch (e) {}
+    // 2. 覆盖 grecaptcha.getResponse 返回 token
+    try {
+      if (window.grecaptcha && typeof window.grecaptcha.getResponse === 'function') {
+        const orig = window.grecaptcha.getResponse.bind(window.grecaptcha);
+        window.grecaptcha.getResponse = function(idx) {
+          const ta = document.getElementById('g-recaptcha-response');
+          if (ta && ta.value && ta.value.length > 10) return ta.value;
+          return orig(idx);
+        };
+        result.override = true;
       }
-    }
+    } catch (e) {}
 
-    // 3. 尝试常见回调名
+    // 3. 在 ___grecaptcha_cfg 中搜索回调函数（限深3层，避免卡死）
+    try {
+      const cfg = window.___grecaptcha_cfg;
+      if (cfg) {
+        const seen = new WeakSet();
+        const queue = [{ obj: cfg, depth: 0 }];
+        const skipTypes = ['CSSStyleSheet','CSSStyleDeclaration','CSSRule','CSSRuleList',
+          'CSSMediaRule','CSSFontFaceRule','CSSKeyframesRule','MediaList','StyleSheetList',
+          'NodeList','HTMLCollection','DOMTokenList','NamedNodeMap','Attr',
+          'HTMLIFrameElement','HTMLDocument','Document','Window','HTMLHtmlElement','HTMLBodyElement'];
+
+        while (queue.length > 0) {
+          const { obj, depth } = queue.shift();
+          if (!obj || depth > 3 || seen.has(obj)) continue;
+          seen.add(obj);
+
+          const keys = Object.keys(obj);
+          for (const key of keys) {
+            try {
+              const val = obj[key];
+              if (typeof val === 'function') {
+                const funcStr = val.toString().substring(0, 100);
+                // reCAPTCHA 回调通常接收一个 token 参数
+                if (funcStr.includes('callback') || funcStr.includes('token') ||
+                    funcStr.includes('response') || funcStr.includes('verify') ||
+                    key === 'callback' || key === 'done' || key === 'success') {
+                  try { val(token); result.cb = `cfg.${key}`; } catch (e) {}
+                }
+              } else if (val && typeof val === 'object') {
+                const type = val.constructor?.name;
+                if (!skipTypes.includes(type)) {
+                  queue.push({ obj: val, depth: depth + 1 });
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 4. 通过 data-callback 属性查找
     if (!result.cb) {
-      const names = ['onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback',
-        'verifyCallback', 'onVerify', 'captchaVerified'];
-      for (const n of names) {
-        if (typeof window[n] === 'function') {
-          try { window[n](token); result.cb = n; break; } catch (e) {}
+      for (const el of document.querySelectorAll('[data-callback]')) {
+        const name = el.getAttribute('data-callback');
+        if (name && typeof window[name] === 'function') {
+          try { window[name](token); result.cb = `data-callback:${name}`; } catch (e) {}
         }
       }
     }
 
+    // 5. 尝试常见回调名
+    if (!result.cb) {
+      const names = ['onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback',
+        'verifyCallback', 'onVerify', 'captchaVerified', 'onCaptchaVerified',
+        'handleCaptcha', 'captchaComplete', 'recaptchaVerified'];
+      for (const n of names) {
+        if (typeof window[n] === 'function') {
+          try { window[n](token); result.cb = `window.${n}`; break; } catch (e) {}
+        }
+      }
+    }
+
+    // 6. 验证 getResponse 现在返回 token
+    try { result.getRes = window.grecaptcha?.getResponse(0)?.length || 0; } catch (e) { result.getRes = e.message; }
+
     return result;
   }, token);
 
-  console.log(`[CAPTCHA] 注入: ta=${r.ta}, cb=${r.cb || '无'}`);
+  console.log(`[CAPTCHA] 注入: ta=${r.ta}, cb=${r.cb || '无'}, override=${r.override}, getRes=${r.getRes}`);
 
-  // 验证
+  // 最终验证
   const v = await page.evaluate(() => {
     const ta = document.getElementById('g-recaptcha-response');
     let gr = 'no';

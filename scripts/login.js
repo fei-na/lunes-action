@@ -209,6 +209,19 @@ async function attemptLoginCore(username, password, index, retryCount) {
 
   const page = await context.newPage();
 
+  // 捕获 JS 控制台错误
+  const jsErrors = [];
+  page.on('console', msg => {
+    if (msg.type() === 'error') {
+      jsErrors.push(msg.text().substring(0, 200));
+      console.log(`[${username}] JS 错误: ${msg.text().substring(0, 150)}`);
+    }
+  });
+  page.on('pageerror', err => {
+    jsErrors.push(err.message.substring(0, 200));
+    console.log(`[${username}] 页面异常: ${err.message.substring(0, 150)}`);
+  });
+
   const screenshot = (name) => `./${name}-${index}-${username.replace(/[@.]/g, '_')}${retryCount > 0 ? `-retry${retryCount}` : ''}.png`;
 
   try {
@@ -324,31 +337,52 @@ async function attemptLoginCore(username, password, index, retryCount) {
     if (recaptchaSolved) {
       console.log(`[${username}] ✅ reCAPTCHA token 已注入`);
 
-      // 等待一下让回调处理完成
+      // 等待回调处理
       await page.waitForTimeout(2000);
 
-      // 检查 reCAPTCHA 是否真的被标记为已解决
-      const isSolved = await page.evaluate(() => {
-        try {
-          if (window.grecaptcha) {
-            const response = window.grecaptcha.getResponse(0);
-            if (response && response.length > 0) return { solved: true, len: response.length };
-          }
-        } catch (e) { /* 忽略 */ }
-        const textarea = document.getElementById('g-recaptcha-response');
-        if (textarea && textarea.value && textarea.value.length > 0) {
-          return { solved: true, len: textarea.value.length, source: 'textarea' };
+      // 详细检查 reCAPTCHA 状态和按钮状态
+      const postInjectState = await page.evaluate(() => {
+        const btn = document.querySelector('button[type="submit"], button');
+        const ta = document.getElementById('g-recaptcha-response');
+        let gr = 'unknown';
+        try { const r = window.grecaptcha?.getResponse(0); gr = r ? `ok(${r.length})` : 'empty'; } catch (e) { gr = e.message; }
+
+        // 查找页面上的所有函数名（可能包含登录处理函数）
+        const globalFuncs = [];
+        for (const key of Object.keys(window)) {
+          try {
+            if (typeof window[key] === 'function' && key.length < 30) {
+              globalFuncs.push(key);
+            }
+          } catch {}
         }
-        return { solved: false };
+
+        return {
+          btnDisabled: btn?.disabled,
+          btnText: btn?.textContent?.trim(),
+          taLen: ta?.value?.length || 0,
+          grecaptcha: gr,
+          globalFuncs: globalFuncs.filter(f =>
+            !f.startsWith('__') && !f.startsWith('webkit') &&
+            !['toString','valueOf','hasOwnProperty','constructor','toLocaleString','isPrototypeOf','propertyIsEnumerable'].includes(f)
+          ).slice(0, 30)
+        };
       });
-      console.log(`[${username}] reCAPTCHA 解决状态: ${JSON.stringify(isSolved)}`);
+      console.log(`[${username}] 注入后状态: ${JSON.stringify(postInjectState)}`);
+
+      // 飞书发送注入后状态
+      await notifyFeishu({
+        ok: true,
+        stage: 'Token 注入后',
+        msg: `按钮 disabled: ${postInjectState.btnDisabled}\n按钮文字: ${postInjectState.btnText}\nta 长度: ${postInjectState.taLen}\ngrecaptcha: ${postInjectState.grecaptcha}\n全局函数: ${postInjectState.globalFuncs.join(', ')}`,
+        username
+      });
 
       // 关闭 reCAPTCHA 挑战弹窗（遮罩层）
       await page.evaluate(() => {
         const challenges = document.querySelectorAll('iframe[title*="recaptcha challenge"]');
         challenges.forEach(iframe => {
           let el = iframe;
-          // 向上找到包含 iframe 的容器并隐藏
           for (let i = 0; i < 5; i++) {
             if (el.parentElement && el.parentElement !== document.body) {
               el = el.parentElement;
@@ -386,23 +420,29 @@ async function attemptLoginCore(username, password, index, retryCount) {
         let body = '';
         try { body = await response.text(); } catch {}
         allResponses.push({ url: url.substring(0, 150), status, body: body.substring(0, 300) });
-        // 记录任何看起来像登录 API 的请求
-        if (url.includes('/auth') || url.includes('/login') || url.includes('/api') || url.includes('/token') || url.includes('/session')) {
-          console.log(`[${username}] API 响应: ${url} (${status}) ${body.substring(0, 200)}`);
-          loginApiCall = { url, status, body: body.substring(0, 500) };
+        // 记录任何非静态资源的请求
+        if (!url.includes('gstatic.com') && !url.includes('google.com/recaptcha') &&
+            !url.includes('recaptcha.net') && !url.includes('.js') && !url.includes('.css') &&
+            !url.includes('favicon') && !url.includes('.png') && !url.includes('.jpg') &&
+            !url.includes('.svg') && !url.includes('.woff') && !url.includes('.ico')) {
+          console.log(`[${username}] 响应: ${status} ${url} ${body.substring(0, 150)}`);
+          if (url.includes('/auth') || url.includes('/login') || url.includes('/api') || url.includes('/token') || url.includes('/session')) {
+            loginApiCall = { url, status, body: body.substring(0, 500) };
+          }
         }
       } catch {}
     };
     page.on('response', responseHandler);
 
-    // 也拦截请求，看发送了什么参数
-    let loginRequest = null;
+    // 也拦截请求
+    const allRequests = [];
     const requestHandler = (request) => {
       const url = request.url();
-      if (url.includes('/auth') || url.includes('/login') || url.includes('/api') || url.includes('/token') || url.includes('/session')) {
-        const postData = request.postData() || '';
-        console.log(`[${username}] API 请求: ${request.method()} ${url} body=${postData.substring(0, 300)}`);
-        loginRequest = { method: request.method(), url, body: postData.substring(0, 500) };
+      allRequests.push({ method: request.method(), url: url.substring(0, 150), body: (request.postData() || '').substring(0, 300) });
+      if (!url.includes('gstatic.com') && !url.includes('google.com/recaptcha') &&
+          !url.includes('recaptcha.net') && !url.includes('.js') && !url.includes('.css') &&
+          !url.includes('favicon') && !url.includes('.png') && !url.includes('.jpg')) {
+        console.log(`[${username}] 请求: ${request.method()} ${url} body=${(request.postData() || '').substring(0, 150)}`);
       }
     };
     page.on('request', requestHandler);
@@ -437,25 +477,18 @@ async function attemptLoginCore(username, password, index, retryCount) {
     page.off('response', responseHandler);
     page.off('request', requestHandler);
 
-    // 打印所有捕获到的响应（用于调试）
-    console.log(`[${username}] 共捕获 ${allResponses.length} 个响应`);
-    const relevantResponses = allResponses.filter(r =>
-      !r.url.includes('google.com/recaptcha') &&
-      !r.url.includes('gstatic.com') &&
-      !r.url.includes('.js') && !r.url.includes('.css') &&
-      !r.url.includes('favicon')
-    );
-    for (const r of relevantResponses) {
-      console.log(`[${username}] 响应: ${r.status} ${r.url} body=${r.body.substring(0, 100)}`);
-    }
+    console.log(`[${username}] 共捕获 ${allRequests.length} 个请求, ${allResponses.length} 个响应`);
 
     // 飞书发送调试信息
     const apiDebugMsg = [
       `点击后 URL: ${urlAfterClick}`,
-      `登录 API 请求: ${loginRequest ? JSON.stringify(loginRequest) : '无'}`,
-      `登录 API 响应: ${loginApiCall ? JSON.stringify(loginApiCall) : '无'}`,
+      `登录 API: ${loginApiCall ? JSON.stringify(loginApiCall) : '无'}`,
+      `总请求数: ${allRequests.length}`,
       `总响应数: ${allResponses.length}`,
-      `相关响应: ${relevantResponses.map(r => `${r.status} ${r.url}`).join('\n')}`
+      `请求列表:`,
+      ...allRequests.filter(r => !r.url.includes('gstatic') && !r.url.includes('recaptcha')).slice(0, 10).map(r => `  ${r.method} ${r.url}`),
+      `响应列表:`,
+      ...allResponses.filter(r => !r.url.includes('gstatic') && !r.url.includes('recaptcha')).slice(0, 10).map(r => `  ${r.status} ${r.url}`)
     ].join('\n');
     await notifyFeishu({
       ok: !!loginApiCall,
@@ -584,10 +617,11 @@ async function attemptLoginCore(username, password, index, retryCount) {
     }
 
     console.log(`[${username}] ❌ 登录失败: ${errorMsg}`);
+    const jsErrorInfo = jsErrors.length > 0 ? `\n\nJS 错误 (${jsErrors.length}):\n${jsErrors.slice(0, 5).join('\n')}` : '';
     await notifyFeishu({
       ok: false,
       stage: '登录结果',
-      msg: errorMsg ? `登录失败: ${errorMsg}\n\n💡 建议：\n1. 检查账号密码是否正确\n2. 如果提示人机验证，手动登录一次后再试\n3. 查看截图了解详情` : '登录失败（原因未知）\n\n💡 建议：查看截图了解详情',
+      msg: errorMsg ? `登录失败: ${errorMsg}${jsErrorInfo}\n\n💡 建议：\n1. 检查账号密码是否正确\n2. 如果提示人机验证，手动登录一次后再试\n3. 查看截图了解详情` : '登录失败（原因未知）\n\n💡 建议：查看截图了解详情',
       screenshotPath: spAfter,
       username
     });
