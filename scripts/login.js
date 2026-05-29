@@ -397,20 +397,133 @@ async function attemptLoginCore(username, password, index, retryCount) {
     // 4) 提交登录
     console.log(`[${username}] 提交登录...`);
 
-    // 先检查 form 的 action 和 method
-    const formInfo = await page.evaluate(() => {
+    // 先注入 JS 级别的 fetch/XHR 拦截器（在 Playwright 监听之前）
+    const jsInterceptResult = await page.evaluate(() => {
+      const result = { intercepted: false, calls: [] };
+
+      // 拦截 fetch
+      const origFetch = window.fetch;
+      window.fetch = function(...args) {
+        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+        const method = args[1]?.method || 'GET';
+        const body = args[1]?.body || '';
+        result.calls.push({ type: 'fetch', method, url: url.substring(0, 200), body: String(body).substring(0, 300) });
+        result.intercepted = true;
+        return origFetch.apply(this, args);
+      };
+
+      // 拦截 XMLHttpRequest
+      const origXHROpen = XMLHttpRequest.prototype.open;
+      const origXHRSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this._interceptMethod = method;
+        this._interceptUrl = url;
+        return origXHROpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        result.calls.push({ type: 'xhr', method: this._interceptMethod, url: (this._interceptUrl || '').substring(0, 200), body: String(body || '').substring(0, 300) });
+        result.intercepted = true;
+        return origXHRSend.call(this, body);
+      };
+
+      // 存储结果引用
+      window.__interceptResult = result;
+      return { ok: true };
+    });
+    console.log(`[${username}] JS 拦截器已注入: ${JSON.stringify(jsInterceptResult)}`);
+
+    // 深度检查 reCAPTCHA 配置，搜索回调函数
+    const recaptchaDebug = await page.evaluate(() => {
+      const cfg = window.___grecaptcha_cfg;
+      if (!cfg) return { hasCfg: false };
+
+      const result = {
+        hasCfg: true,
+        cfgKeys: Object.keys(cfg),
+        clientCount: cfg.clients ? Object.keys(cfg.clients).length : 0,
+        callbacks: [],
+        deepProperties: []
+      };
+
+      // 遍历 clients 的前2层，记录所有属性名和类型
+      if (cfg.clients) {
+        for (const [cid, client] of Object.entries(cfg.clients)) {
+          const level1 = {};
+          for (const [k, v] of Object.entries(client)) {
+            level1[k] = typeof v;
+            if (typeof v === 'function') {
+              result.callbacks.push({ path: `clients.${cid}.${k}`, type: 'function' });
+            }
+            // 检查 level 2
+            if (v && typeof v === 'object' && !(v instanceof HTMLElement)) {
+              for (const [k2, v2] of Object.entries(v)) {
+                if (typeof v2 === 'function') {
+                  result.callbacks.push({ path: `clients.${cid}.${k}.${k2}`, type: 'function' });
+                }
+                // 检查 level 3
+                if (v2 && typeof v2 === 'object' && !(v2 instanceof HTMLElement)) {
+                  for (const [k3, v3] of Object.entries(v2)) {
+                    if (typeof v3 === 'function') {
+                      result.callbacks.push({ path: `clients.${cid}.${k}.${k2}.${k3}`, type: 'function' });
+                    }
+                    if (typeof v3 === 'string' && v3.length < 100) {
+                      result.deepProperties.push({ path: `clients.${cid}.${k}.${k2}.${k3}`, value: v3 });
+                    }
+                  }
+                }
+              }
+            }
+          }
+          result.deepProperties.push({ path: `clients.${cid}`, keys: Object.keys(level1).join(',') });
+        }
+      }
+
+      // 也检查顶层的非 client 属性
+      for (const [k, v] of Object.entries(cfg)) {
+        if (k !== 'clients' && typeof v === 'function') {
+          result.callbacks.push({ path: k, type: 'function' });
+        }
+      }
+
+      return result;
+    });
+    console.log(`[${username}] reCAPTCHA 配置: ${JSON.stringify(recaptchaDebug).substring(0, 500)}`);
+
+    // 检查表单和按钮的事件监听器
+    const formDebug = await page.evaluate(() => {
       const form = document.querySelector('form');
-      if (!form) return { hasForm: false };
+      const btn = document.querySelector('button[type="submit"], button');
+      const allInputs = document.querySelectorAll('input');
+      const inputInfo = Array.from(allInputs).map(i => ({
+        name: i.name, type: i.type, value: i.value?.substring(0, 30),
+        id: i.id
+      }));
+
+      // 检查按钮的 onclick 属性
+      const btnOnclick = btn?.getAttribute('onclick');
+      const btnType = btn?.type;
+      const btnClasses = btn?.className;
+
+      // 检查表单的 onsubmit
+      const formOnsubmit = form?.getAttribute('onsubmit');
+
+      // 检查所有 script 标签的内容（只看前500字符）
+      const scripts = Array.from(document.querySelectorAll('script[src]')).map(s => s.src);
+
       return {
-        hasForm: true,
-        action: form.action,
-        method: form.method,
-        hasSubmitEvent: !!form.onsubmit
+        formAction: form?.action,
+        formMethod: form?.method,
+        formOnsubmit,
+        btnOnclick,
+        btnType,
+        btnClasses,
+        inputs: inputInfo,
+        scriptSrcs: scripts.filter(s => !s.includes('recaptcha') && !s.includes('gstatic')).slice(0, 10)
       };
     });
-    console.log(`[${username}] 表单信息: ${JSON.stringify(formInfo)}`);
+    console.log(`[${username}] 表单详情: ${JSON.stringify(formDebug)}`);
 
-    // 设置网络监听（在点击之前！）
+    // 设置 Playwright 级别网络监听
     let loginApiCall = null;
     const allResponses = [];
     const responseHandler = async (response) => {
@@ -419,35 +532,12 @@ async function attemptLoginCore(username, password, index, retryCount) {
         const status = response.status();
         let body = '';
         try { body = await response.text(); } catch {}
-        allResponses.push({ url: url.substring(0, 150), status, body: body.substring(0, 300) });
-        // 记录任何非静态资源的请求
-        if (!url.includes('gstatic.com') && !url.includes('google.com/recaptcha') &&
-            !url.includes('recaptcha.net') && !url.includes('.js') && !url.includes('.css') &&
-            !url.includes('favicon') && !url.includes('.png') && !url.includes('.jpg') &&
-            !url.includes('.svg') && !url.includes('.woff') && !url.includes('.ico')) {
-          console.log(`[${username}] 响应: ${status} ${url} ${body.substring(0, 150)}`);
-          if (url.includes('/auth') || url.includes('/login') || url.includes('/api') || url.includes('/token') || url.includes('/session')) {
-            loginApiCall = { url, status, body: body.substring(0, 500) };
-          }
-        }
+        allResponses.push({ url: url.substring(0, 200), status, body: body.substring(0, 300) });
       } catch {}
     };
     page.on('response', responseHandler);
 
-    // 也拦截请求
-    const allRequests = [];
-    const requestHandler = (request) => {
-      const url = request.url();
-      allRequests.push({ method: request.method(), url: url.substring(0, 150), body: (request.postData() || '').substring(0, 300) });
-      if (!url.includes('gstatic.com') && !url.includes('google.com/recaptcha') &&
-          !url.includes('recaptcha.net') && !url.includes('.js') && !url.includes('.css') &&
-          !url.includes('favicon') && !url.includes('.png') && !url.includes('.jpg')) {
-        console.log(`[${username}] 请求: ${request.method()} ${url} body=${(request.postData() || '').substring(0, 150)}`);
-      }
-    };
-    page.on('request', requestHandler);
-
-    // 点击登录按钮
+    // 点击登录按钮（用 Playwright 原生点击）
     console.log(`[${username}] 点击登录按钮...`);
     try {
       await loginBtn.click({ timeout: 5_000, force: true });
@@ -457,41 +547,79 @@ async function attemptLoginCore(username, password, index, retryCount) {
     }
 
     // 等待可能的 API 响应
-    await page.waitForTimeout(8000);
+    await page.waitForTimeout(5000);
+
+    // 检查 JS 拦截器捕获的调用
+    const jsCalls = await page.evaluate(() => window.__interceptResult?.calls || []);
+    console.log(`[${username}] JS 拦截到 ${jsCalls.length} 个调用`);
+    for (const c of jsCalls) {
+      console.log(`[${username}] JS 调用: ${c.type} ${c.method} ${c.url} body=${c.body?.substring(0, 100)}`);
+    }
+
     const urlAfterClick = page.url();
     console.log(`[${username}] 点击后 URL: ${urlAfterClick}`);
 
-    // 如果还在登录页且没捕获到 API 调用，尝试 JS 方式触发表单提交
-    if (/\/auth\/login/i.test(urlAfterClick) && !loginApiCall) {
-      console.log(`[${username}] 未检测到 API 调用，尝试 JS 触发...`);
+    // 如果没有捕获到 API 调用，尝试更多方式
+    if (jsCalls.length === 0 && allResponses.filter(r => !r.url.includes('recaptcha') && !r.url.includes('gstatic')).length === 0) {
+      console.log(`[${username}] 无 API 调用，尝试其他方式...`);
+
+      // 方式1: 尝试 dispatchEvent submit
       await page.evaluate(() => {
         const form = document.querySelector('form');
         if (form) {
           form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
         }
       });
-      await page.waitForTimeout(5000);
+      await page.waitForTimeout(3000);
+
+      // 方式2: 尝试直接调用 form.submit()
+      const afterSubmit = await page.evaluate(() => {
+        const calls = window.__interceptResult?.calls || [];
+        return { calls: calls.length, url: window.location.href };
+      });
+      console.log(`[${username}] submit 后: ${JSON.stringify(afterSubmit)}`);
+
+      if (afterSubmit.calls === 0) {
+        // 方式3: 搜索页面上的所有按钮并尝试点击
+        const btns = await page.evaluate(() => {
+          return Array.from(document.querySelectorAll('button, input[type="submit"], a[role="button"]')).map(b => ({
+            text: b.textContent?.trim()?.substring(0, 30),
+            type: b.type,
+            disabled: b.disabled,
+            classes: b.className?.substring(0, 50)
+          }));
+        });
+        console.log(`[${username}] 所有按钮: ${JSON.stringify(btns)}`);
+      }
     }
 
     // 移除监听器
     page.off('response', responseHandler);
-    page.off('request', requestHandler);
 
-    console.log(`[${username}] 共捕获 ${allRequests.length} 个请求, ${allResponses.length} 个响应`);
+    // 收集所有信息发送飞书
+    const finalJSCalls = await page.evaluate(() => window.__interceptResult?.calls || []);
+    const nonStaticResponses = allResponses.filter(r =>
+      !r.url.includes('recaptcha') && !r.url.includes('gstatic') &&
+      !r.url.includes('.js') && !r.url.includes('.css') && !r.url.includes('favicon')
+    );
 
-    // 飞书发送调试信息
+    // 飞书发送详细调试信息
     const apiDebugMsg = [
       `点击后 URL: ${urlAfterClick}`,
-      `登录 API: ${loginApiCall ? JSON.stringify(loginApiCall) : '无'}`,
-      `总请求数: ${allRequests.length}`,
-      `总响应数: ${allResponses.length}`,
-      `请求列表:`,
-      ...allRequests.filter(r => !r.url.includes('gstatic') && !r.url.includes('recaptcha')).slice(0, 10).map(r => `  ${r.method} ${r.url}`),
-      `响应列表:`,
-      ...allResponses.filter(r => !r.url.includes('gstatic') && !r.url.includes('recaptcha')).slice(0, 10).map(r => `  ${r.status} ${r.url}`)
+      `JS 拦截调用: ${finalJSCalls.length}`,
+      ...finalJSCalls.map(c => `  ${c.type} ${c.method} ${c.url} ${c.body?.substring(0, 100) || ''}`),
+      `Playwright 响应: ${nonStaticResponses.length}`,
+      ...nonStaticResponses.slice(0, 5).map(r => `  ${r.status} ${r.url}`),
+      `reCAPTCHA 回调: ${recaptchaDebug.callbacks.length}`,
+      ...recaptchaDebug.callbacks.map(c => `  ${c.path}`),
+      `reCAPTCHA 属性: ${recaptchaDebug.deepProperties.slice(0, 10).map(p => `${p.path}=${p.value || p.keys || ''}`).join(' | ')}`,
+      `表单: action=${formDebug.formAction} method=${formDebug.formMethod} onsubmit=${formDebug.formOnsubmit || '无'}`,
+      `按钮: type=${formDebug.btnType} onclick=${formDebug.btnOnclick || '无'} classes=${formDebug.btnClasses}`,
+      `输入框: ${formDebug.inputs.map(i => `${i.name}(${i.type})=${i.value}`).join(', ')}`,
+      `脚本: ${formDebug.scriptSrcs.join(' | ')}`
     ].join('\n');
     await notifyFeishu({
-      ok: !!loginApiCall,
+      ok: finalJSCalls.length > 0 || nonStaticResponses.length > 0,
       stage: 'API 调试',
       msg: apiDebugMsg,
       username
