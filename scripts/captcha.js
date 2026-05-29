@@ -190,45 +190,50 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
       }
     } catch (e) {}
 
-    // 3. 在 ___grecaptcha_cfg 中搜索回调函数（限深3层，避免卡死）
+    // 3. 直接访问已知的回调路径 + 搜索其他回调
     try {
       const cfg = window.___grecaptcha_cfg;
-      if (cfg) {
-        const seen = new WeakSet();
-        const queue = [{ obj: cfg, depth: 0 }];
-        const skipTypes = ['CSSStyleSheet','CSSStyleDeclaration','CSSRule','CSSRuleList',
-          'CSSMediaRule','CSSFontFaceRule','CSSKeyframesRule','MediaList','StyleSheetList',
-          'NodeList','HTMLCollection','DOMTokenList','NamedNodeMap','Attr',
-          'HTMLIFrameElement','HTMLDocument','Document','Window','HTMLHtmlElement','HTMLBodyElement'];
+      if (cfg?.clients) {
+        for (const [cid, client] of Object.entries(cfg.clients)) {
+          // 直接访问 clients[id].g.g.callback（已知路径）
+          try {
+            const gg = client.g?.g;
+            if (gg) {
+              // 记录所有属性
+              const ggKeys = Object.keys(gg);
+              result.cfgInfo = `g.g keys: ${ggKeys.join(',')}`;
 
-        while (queue.length > 0) {
-          const { obj, depth } = queue.shift();
-          if (!obj || depth > 3 || seen.has(obj)) continue;
-          seen.add(obj);
+              // 直接调用 callback
+              if (typeof gg['callback'] === 'function') {
+                gg['callback'](token);
+                result.cb = `clients.${cid}.g.g.callback`;
+              }
 
-          const keys = Object.keys(obj);
-          for (const key of keys) {
-            try {
-              const val = obj[key];
-              if (typeof val === 'function') {
-                const funcStr = val.toString().substring(0, 100);
-                // reCAPTCHA 回调通常接收一个 token 参数
-                if (funcStr.includes('callback') || funcStr.includes('token') ||
-                    funcStr.includes('response') || funcStr.includes('verify') ||
-                    key === 'callback' || key === 'done' || key === 'success') {
-                  try { val(token); result.cb = `cfg.${key}`; } catch (e) {}
-                }
-              } else if (val && typeof val === 'object') {
-                const type = val.constructor?.name;
-                if (!skipTypes.includes(type)) {
-                  queue.push({ obj: val, depth: depth + 1 });
+              // 也检查其他可能的回调名
+              const cbNames = ['callback', 'expired-callback', 'error-callback'];
+              for (const name of cbNames) {
+                if (name !== 'callback' && typeof gg[name] === 'function') {
+                  // 只记录，不调用 expired/error
+                  result.cfgInfo += ` | ${name}=func`;
                 }
               }
-            } catch {}
+            }
+          } catch (e) { result.cfgError = e.message; }
+
+          // 如果直接路径没找到，遍历 client 的第一层属性
+          if (!result.cb) {
+            for (const [k, v] of Object.entries(client)) {
+              if (typeof v === 'function') {
+                const funcStr = Function.prototype.toString.call(v).substring(0, 80);
+                if (funcStr.includes('callback') || k === 'callback') {
+                  try { v(token); result.cb = `clients.${cid}.${k}`; break; } catch {}
+                }
+              }
+            }
           }
         }
       }
-    } catch (e) {}
+    } catch (e) { result.cfgError2 = e.message; }
 
     // 4. 通过 data-callback 属性查找
     if (!result.cb) {
@@ -258,7 +263,7 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
     return result;
   }, token);
 
-  console.log(`[CAPTCHA] 注入: ta=${r.ta}, cb=${r.cb || '无'}, override=${r.override}, getRes=${r.getRes}`);
+  console.log(`[CAPTCHA] 注入: ta=${r.ta}, cb=${r.cb || '无'}, override=${r.override}, getRes=${r.getRes}, cfg=${r.cfgInfo || '无'}, err=${r.cfgError || r.cfgError2 || '无'}`);
 
   // 最终验证
   const v = await page.evaluate(() => {
