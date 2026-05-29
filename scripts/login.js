@@ -8,7 +8,7 @@
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
-import { detectAndSolveRecaptcha, detectAndSolveTurnstile } from './captcha.js';
+import { detectAndSolveRecaptcha, detectAndSolveTurnstile, checkBalance } from './captcha.js';
 
 // 启用 stealth 插件，绕过自动化检测
 chromium.use(StealthPlugin());
@@ -220,7 +220,7 @@ async function attemptLoginCore(username, password, index, retryCount) {
     });
 
     // 检测并尝试解决 Cloudflare Turnstile（页面级拦截）
-    const apiKey = process.env.CAPSOLVER_API_KEY || process.env.TWOCAPTCHA_API_KEY;
+    const apiKey = process.env.TWOCAPTCHA_API_KEY;
     const turnstileSolved = apiKey ? await detectAndSolveTurnstile(page, apiKey) : false;
     if (!turnstileSolved) {
       // 如果没有 Turnstile 或解决失败，再检查传统的人机验证文案
@@ -303,14 +303,21 @@ async function attemptLoginCore(username, password, index, retryCount) {
     console.log(`[${username}] 检测是否有 reCAPTCHA...`);
     const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
 
+    // 检查 2Captcha 余额
+    let balanceInfo = '未检查';
+    if (apiKey) {
+      const bal = await checkBalance(apiKey);
+      balanceInfo = bal.ok ? `$${bal.balance}` : `错误: ${bal.error}`;
+    }
+
     // 发送调试信息到飞书
     const debugMsg = [
-      `reCAPTCHA 检测: ${recaptchaSolved ? '成功' : '未检测到/失败'}`,
+      `2Captcha 余额: ${balanceInfo}`,
       `API Key: ${apiKey ? '已配置' : '未配置'}`,
+      `reCAPTCHA 检测: ${recaptchaSolved ? '成功' : '未检测到/失败'}`,
       `iframe 数量: ${debugInfo.iframeCount}`,
       `iframe 列表: ${debugInfo.iframeSrcs.join(' | ')}`,
       `grecaptcha 对象: ${debugInfo.hasGrecaptcha}`,
-      `grecaptcha_cfg: ${debugInfo.hasCfg}`,
       `g-recaptcha div: ${JSON.stringify(debugInfo.gRecaptchaDiv)}`,
       `textarea: ${JSON.stringify(debugInfo.textarea)}`,
       `表单: ${JSON.stringify(debugInfo.forms)}`,
