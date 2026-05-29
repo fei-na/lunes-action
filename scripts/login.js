@@ -334,6 +334,25 @@ async function attemptLoginCore(username, password, index, retryCount) {
     console.log(`[${username}] 检测是否有 reCAPTCHA...`);
     const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
 
+    // 回调可能已经触发了登录跳转！先检查 URL
+    const urlAfterRecaptcha = page.url();
+    console.log(`[${username}] reCAPTCHA 后 URL: ${urlAfterRecaptcha}`);
+    const loginSucceededEarly = !/\/auth\/login/i.test(urlAfterRecaptcha);
+
+    if (loginSucceededEarly) {
+      console.log(`[${username}] ✅ 回调触发了登录跳转！`);
+      const sp = screenshot('03-login-success-via-callback');
+      await page.screenshot({ path: sp, fullPage: true });
+      await notifyFeishu({
+        ok: true,
+        stage: '登录结果',
+        msg: `reCAPTCHA 回调直接触发了登录跳转！\nURL: ${urlAfterRecaptcha}`,
+        screenshotPath: sp,
+        username
+      });
+      return { success: true, username, message: '登录成功（回调触发跳转）' };
+    }
+
     if (recaptchaSolved) {
       console.log(`[${username}] ✅ reCAPTCHA token 已注入`);
 
@@ -559,6 +578,22 @@ async function attemptLoginCore(username, password, index, retryCount) {
     const urlAfterClick = page.url();
     console.log(`[${username}] 点击后 URL: ${urlAfterClick}`);
 
+    // 检查是否已经跳转（登录成功）
+    if (!/\/auth\/login/i.test(urlAfterClick)) {
+      console.log(`[${username}] ✅ 页面已跳转，登录成功！`);
+      const sp = screenshot('03-redirect-success');
+      await page.screenshot({ path: sp, fullPage: true });
+      page.off('response', responseHandler);
+      await notifyFeishu({
+        ok: true,
+        stage: '登录结果',
+        msg: `页面已跳转到: ${urlAfterClick}`,
+        screenshotPath: sp,
+        username
+      });
+      return { success: true, username, message: '登录成功（页面跳转）' };
+    }
+
     // 如果没有捕获到 API 调用，尝试更多方式
     if (jsCalls.length === 0 && allResponses.filter(r => !r.url.includes('recaptcha') && !r.url.includes('gstatic')).length === 0) {
       console.log(`[${username}] 无 API 调用，尝试其他方式...`);
@@ -628,10 +663,24 @@ async function attemptLoginCore(username, password, index, retryCount) {
     await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
     await page.waitForTimeout(2000);
 
-    // 5) 再次检测是否仍有人机验证
+    // 5) 再次检测是否仍有人机验证（先检查是否已跳转）
+    const currentUrl = page.url();
+    if (!/\/auth\/login/i.test(currentUrl)) {
+      console.log(`[${username}] ✅ 页面已跳转到: ${currentUrl}`);
+      const sp = screenshot('03-redirect-success');
+      await page.screenshot({ path: sp, fullPage: true });
+      await notifyFeishu({
+        ok: true,
+        stage: '登录结果',
+        msg: `页面已跳转到: ${currentUrl}`,
+        screenshotPath: sp,
+        username
+      });
+      return { success: true, username, message: '登录成功（页面跳转）' };
+    }
+
     const humanCheckAfterSubmit = await page.locator('text=/Verify you are human|需要验证|安全检查|review the security|Cloudflare|captcha|recaptcha|人机|验证|did not render/i').first();
     const pageContent = await page.locator('body').innerText().catch(() => '');
-    const currentUrl = page.url();
     const hasHumanCheck = await humanCheckAfterSubmit.count() > 0;
     const hasRenderError = pageContent.includes('did not render');
 
