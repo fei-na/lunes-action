@@ -16,6 +16,7 @@ jobs:
       USERNAME_AND_PASSWORD: ${{ secrets.USERNAME_AND_PASSWORD }}
       FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
       TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
+      CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
 
     steps:
       - name: Checkout

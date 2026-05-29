@@ -220,7 +220,7 @@ async function attemptLoginCore(username, password, index, retryCount) {
     });
 
     // 检测并尝试解决 Cloudflare Turnstile（页面级拦截）
-    const apiKey = process.env.TWOCAPTCHA_API_KEY;
+    const apiKey = process.env.CAPSOLVER_API_KEY || process.env.TWOCAPTCHA_API_KEY;
     const turnstileSolved = apiKey ? await detectAndSolveTurnstile(page, apiKey) : false;
     if (!turnstileSolved) {
       // 如果没有 Turnstile 或解决失败，再检查传统的人机验证文案
@@ -232,7 +232,7 @@ async function attemptLoginCore(username, password, index, retryCount) {
           await notifyFeishu({
             ok: false,
             stage: '打开登录页',
-            msg: '检测到人机验证，但未配置 TWOCAPTCHA_API_KEY，无法自动解决。',
+            msg: '检测到人机验证，但未配置 CAPSOLVER_API_KEY，无法自动解决。',
             screenshotPath: sp,
             username
           });
@@ -432,7 +432,7 @@ async function attemptLoginCore(username, password, index, retryCount) {
         stage: '登录结果',
         msg: apiKey
           ? `🔐 人机验证未解决\n\nURL: ${currentUrl}\n检测到验证: ${hasHumanCheck}\n渲染错误: ${hasRenderError}`
-          : '🔐 未配置 TWOCAPTCHA_API_KEY',
+          : '🔐 未配置 CAPSOLVER_API_KEY',
         screenshotPath: sp,
         username
       });

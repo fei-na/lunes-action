@@ -1,131 +1,106 @@
 // scripts/captcha.js
-// 2Captcha API 集成，支持 reCAPTCHA v2 和 Cloudflare Turnstile
+// CapSolver API 集成，支持 reCAPTCHA v2 和 Cloudflare Turnstile
 
-const TWOCAPTCHA_API_BASE = 'http://2captcha.com';
-const POLL_INTERVAL = 5000; // 轮询间隔 5 秒
+const CAPSOLVER_API_BASE = 'https://api.capsolver.com';
+const POLL_INTERVAL = 3000; // 轮询间隔 3 秒
 const MAX_WAIT_TIME = 180_000; // 最大等待 3 分钟
 
 /**
- * 通过 2Captcha 解决 reCAPTCHA v2
- * @param {string} siteKey - reCAPTCHA 的 sitekey
- * @param {string} pageUrl - 页面 URL
- * @param {string} apiKey - 2Captcha API key
- * @returns {Promise<string>} - 解决后的 token
+ * 通用 CapSolver 任务提交和轮询
  */
-export async function solveRecaptchaV2(siteKey, pageUrl, apiKey) {
-  console.log(`[CAPTCHA] 开始解决 reCAPTCHA v2, siteKey: ${siteKey}`);
+async function solveWithCapSolver(task, apiKey) {
+  console.log(`[CAPTCHA] 提交 CapSolver 任务: ${task.type}`);
 
-  // 提交任务
-  const submitUrl = new URL('/in.php', TWOCAPTCHA_API_BASE);
-  submitUrl.searchParams.set('key', apiKey);
-  submitUrl.searchParams.set('method', 'userrecaptcha');
-  submitUrl.searchParams.set('googlekey', siteKey);
-  submitUrl.searchParams.set('pageurl', pageUrl);
-  submitUrl.searchParams.set('json', '1');
+  // 1. 创建任务
+  const createRes = await fetch(`${CAPSOLVER_API_BASE}/createTask`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clientKey: apiKey, task }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const createData = await createRes.json();
 
-  const submitRes = await fetch(submitUrl.toString(), { method: 'POST' });
-  const submitData = await submitRes.json();
-
-  if (submitData.status !== 1) {
-    throw new Error(`2Captcha 提交失败: ${submitData.request}`);
+  if (createData.errorId !== 0) {
+    throw new Error(`CapSolver 创建任务失败: ${createData.errorDescription || createData.errorCode}`);
   }
 
-  const taskId = submitData.request;
-  console.log(`[CAPTCHA] 任务已提交, ID: ${taskId}`);
+  const taskId = createData.taskId;
+  console.log(`[CAPTCHA] 任务已创建, ID: ${taskId}`);
 
-  // 轮询结果
-  return await pollResult(taskId, apiKey);
-}
-
-/**
- * 通过 2Captcha 解决 Cloudflare Turnstile
- * @param {string} siteKey - Turnstile 的 sitekey
- * @param {string} pageUrl - 页面 URL
- * @param {string} apiKey - 2Captcha API key
- * @returns {Promise<string>} - 解决后的 token
- */
-export async function solveTurnstile(siteKey, pageUrl, apiKey) {
-  console.log(`[CAPTCHA] 开始解决 Turnstile, siteKey: ${siteKey}`);
-
-  const submitUrl = new URL('/in.php', TWOCAPTCHA_API_BASE);
-  submitUrl.searchParams.set('key', apiKey);
-  submitUrl.searchParams.set('method', 'turnstile');
-  submitUrl.searchParams.set('sitekey', siteKey);
-  submitUrl.searchParams.set('pageurl', pageUrl);
-  submitUrl.searchParams.set('json', '1');
-
-  const submitRes = await fetch(submitUrl.toString(), { method: 'POST' });
-  const submitData = await submitRes.json();
-
-  if (submitData.status !== 1) {
-    throw new Error(`2Captcha 提交失败: ${submitData.request}`);
-  }
-
-  const taskId = submitData.request;
-  console.log(`[CAPTCHA] 任务已提交, ID: ${taskId}`);
-
-  return await pollResult(taskId, apiKey);
-}
-
-/**
- * 轮询获取结果
- */
-async function pollResult(taskId, apiKey) {
+  // 2. 轮询结果
   const startTime = Date.now();
-
   while (Date.now() - startTime < MAX_WAIT_TIME) {
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-
-    const resultUrl = new URL('/res.php', TWOCAPTCHA_API_BASE);
-    resultUrl.searchParams.set('key', apiKey);
-    resultUrl.searchParams.set('action', 'get');
-    resultUrl.searchParams.set('id', taskId);
-    resultUrl.searchParams.set('json', '1');
-
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    console.log(`[CAPTCHA] 轮询结果... (${elapsed}s, taskId: ${taskId})`);
+    console.log(`[CAPTCHA] 轮询结果... (${elapsed}s)`);
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15_000); // 15秒单次请求超时
-      const resultRes = await fetch(resultUrl.toString(), { signal: controller.signal });
-      clearTimeout(timeout);
+      const resultRes = await fetch(`${CAPSOLVER_API_BASE}/getTaskResult`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientKey: apiKey, taskId }),
+        signal: AbortSignal.timeout(15_000),
+      });
       const resultData = await resultRes.json();
 
-      if (resultData.status === 1) {
+      if (resultData.errorId !== 0) {
+        throw new Error(`CapSolver 查询失败: ${resultData.errorDescription || resultData.errorCode}`);
+      }
+
+      if (resultData.status === 'ready') {
         console.log(`[CAPTCHA] 解决成功! 耗时 ${elapsed}s`);
-        return resultData.request;
+        return resultData.solution;
       }
 
-      if (resultData.request === 'CAPCHA_NOT_READY') {
-        console.log(`[CAPTCHA] 结果未就绪，继续等待...`);
-        continue;
-      }
-
-      // 其他错误（如 ERROR_CAPTCHA_UNSOLVABLE, ERROR_ZERO_BALANCE 等）
-      console.log(`[CAPTCHA] API 返回错误: ${resultData.request}`);
-      throw new Error(`2Captcha 查询失败: ${resultData.request}`);
+      // processing - 继续等待
+      console.log(`[CAPTCHA] 处理中...`);
     } catch (e) {
-      if (e.name === 'AbortError') {
-        console.log(`[CAPTCHA] 单次请求超时 (${elapsed}s)，重试...`);
+      if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+        console.log(`[CAPTCHA] 单次请求超时，重试...`);
         continue;
       }
       throw e;
     }
   }
 
-  throw new Error(`2Captcha 超时（${Math.round(MAX_WAIT_TIME / 1000)}秒未返回结果）`);
+  throw new Error(`CapSolver 超时（${Math.round(MAX_WAIT_TIME / 1000)}秒未返回结果）`);
+}
+
+/**
+ * 解决 reCAPTCHA v2
+ */
+export async function solveRecaptchaV2(siteKey, pageUrl, apiKey) {
+  console.log(`[CAPTCHA] 开始解决 reCAPTCHA v2, siteKey: ${siteKey}, URL: ${pageUrl}`);
+  const solution = await solveWithCapSolver({
+    type: 'ReCaptchaV2TaskProxyLess',
+    websiteURL: pageUrl,
+    websiteKey: siteKey,
+  }, apiKey);
+
+  const token = solution.gRecaptchaResponse;
+  console.log(`[CAPTCHA] 获得 token (前20字符): ${token.substring(0, 20)}... (长度: ${token.length})`);
+  return token;
+}
+
+/**
+ * 解决 Cloudflare Turnstile
+ */
+export async function solveTurnstile(siteKey, pageUrl, apiKey) {
+  console.log(`[CAPTCHA] 开始解决 Turnstile, siteKey: ${siteKey}`);
+  const solution = await solveWithCapSolver({
+    type: 'AntiTurnstileTaskProxyLess',
+    websiteURL: pageUrl,
+    websiteKey: siteKey,
+  }, apiKey);
+  return solution.token;
 }
 
 /**
  * 在页面中检测并解决 reCAPTCHA v2
- * @param {import('playwright').Page} page - Playwright 页面对象
- * @param {string} apiKey - 2Captcha API key
- * @returns {Promise<boolean>} - 是否成功解决
  */
 export async function detectAndSolveRecaptcha(page, apiKey) {
-  // 检测 reCAPTCHA - 多种方式
-  const recaptchaIframeCount = await page.locator('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]').count();
+  // 检测 reCAPTCHA
+  const recaptchaIframeCount = await page.locator('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]').count();
   const gRecaptchaDiv = await page.locator('.g-recaptcha, [data-sitekey]').count();
   const gRecaptchaTextarea = await page.locator('#g-recaptcha-response, textarea[name="g-recaptcha-response"]').count();
 
@@ -136,57 +111,41 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
     return false;
   }
 
-  // 提取 sitekey - 多种方式，带详细日志
+  // 提取 sitekey
   let siteKey = await page.evaluate(() => {
-    // 方式1: 从 g-recaptcha 的 div 属性中提取
-    const recaptchaDiv = document.querySelector('.g-recaptcha, [data-sitekey]');
-    if (recaptchaDiv) {
-      const key = recaptchaDiv.getAttribute('data-sitekey');
-      if (key) return { key, method: 'data-sitekey div' };
+    // 方式1: data-sitekey div
+    const div = document.querySelector('.g-recaptcha, [data-sitekey]');
+    if (div?.getAttribute('data-sitekey')) {
+      return { key: div.getAttribute('data-sitekey'), method: 'data-sitekey' };
     }
 
-    // 方式2: 从 iframe src 中提取
-    const iframes = document.querySelectorAll('iframe');
-    for (const iframe of iframes) {
-      const src = iframe.src || '';
-      if (src.includes('recaptcha') || src.includes('google.com/recaptcha')) {
-        const match = src.match(/k=([^&]+)/);
-        if (match) return { key: match[1], method: `iframe src (${src.substring(0, 80)}...)` };
+    // 方式2: iframe src
+    for (const iframe of document.querySelectorAll('iframe')) {
+      if (iframe.src?.includes('recaptcha')) {
+        const match = iframe.src.match(/k=([^&]+)/);
+        if (match) return { key: match[1], method: 'iframe src' };
       }
     }
 
-    // 方式3: 从页面 script 中提取
-    const scripts = document.querySelectorAll('script');
-    for (const script of scripts) {
-      const text = script.textContent || '';
-      // 匹配各种格式: sitekey: "xxx", sitekey='xxx', "sitekey":"xxx"
-      const match = text.match(/['"]?sitekey['"]?\s*[:=]\s*['"]([0-9A-Za-z_-]{20,})['"]/);
-      if (match) return { key: match[1], method: 'script content' };
+    // 方式3: script 内容
+    for (const script of document.querySelectorAll('script')) {
+      const match = script.textContent?.match(/['"]?sitekey['"]?\s*[:=]\s*['"]([0-9A-Za-z_-]{20,})['"]/);
+      if (match) return { key: match[1], method: 'script' };
     }
 
-    // 方式4: 从全局变量中提取
-    if (window.___grecaptcha_cfg) {
-      const cfg = window.___grecaptcha_cfg;
-      // 遍历 clients 对象查找 sitekey
-      if (cfg.clients) {
-        for (const clientId in cfg.clients) {
-          const client = cfg.clients[clientId];
-          const sitekey = findSitekeyInObject(client);
-          if (sitekey) return { key: sitekey, method: 'grecaptcha_cfg.clients' };
-        }
+    // 方式4: ___grecaptcha_cfg
+    if (window.___grecaptcha_cfg?.clients) {
+      for (const id in window.___grecaptcha_cfg.clients) {
+        const key = findKey(window.___grecaptcha_cfg.clients[id], 0);
+        if (key) return { key, method: 'grecaptcha_cfg' };
       }
     }
 
-    function findSitekeyInObject(obj, depth = 0) {
-      if (depth > 5 || !obj || typeof obj !== 'object') return null;
-      for (const key in obj) {
-        if (key === 'sitekey' && typeof obj[key] === 'string' && obj[key].length > 20) {
-          return obj[key];
-        }
-        if (typeof obj[key] === 'object') {
-          const found = findSitekeyInObject(obj[key], depth + 1);
-          if (found) return found;
-        }
+    function findKey(obj, d) {
+      if (d > 5 || !obj || typeof obj !== 'object') return null;
+      for (const k in obj) {
+        if (k === 'sitekey' && typeof obj[k] === 'string' && obj[k].length > 20) return obj[k];
+        if (typeof obj[k] === 'object') { const f = findKey(obj[k], d + 1); if (f) return f; }
       }
       return null;
     }
@@ -195,252 +154,146 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
   });
 
   if (siteKey?.key) {
-    console.log(`[CAPTCHA] 找到 siteKey: ${siteKey.key} (通过 ${siteKey.method})`);
+    console.log(`[CAPTCHA] siteKey: ${siteKey.key} (${siteKey.method})`);
     siteKey = siteKey.key;
   } else if (!siteKey) {
-    // 尝试从 Playwright 层面提取 - 遍历所有 iframe（包括 challenge iframe）
-    console.log('[CAPTCHA] evaluate 未找到 sitekey，尝试 Playwright 层面提取...');
-    const iframeLocators = page.locator('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha.net"]');
-    const iframeCount = await iframeLocators.count();
-    console.log(`[CAPTCHA] 找到 ${iframeCount} 个 reCAPTCHA 相关 iframe`);
-    for (let i = 0; i < iframeCount; i++) {
-      const src = await iframeLocators.nth(i).getAttribute('src').catch(() => null);
-      if (src) {
-        const match = src.match(/k=([^&]+)/);
-        if (match) {
-          siteKey = match[1];
-          console.log(`[CAPTCHA] 从 iframe[${i}] src 提取: ${siteKey}`);
-          break;
-        }
-      }
+    // Playwright 层面提取
+    const count = await page.locator('iframe[src*="recaptcha"], iframe[src*="recaptcha.net"]').count();
+    for (let i = 0; i < count; i++) {
+      const src = await page.locator('iframe[src*="recaptcha"], iframe[src*="recaptcha.net"]').nth(i).getAttribute('src').catch(() => null);
+      const match = src?.match(/k=([^&]+)/);
+      if (match) { siteKey = match[1]; break; }
     }
   }
 
   if (!siteKey) {
-    console.log('[CAPTCHA] 无法提取 siteKey，跳过自动解决');
+    console.log('[CAPTCHA] 无法提取 siteKey');
     return false;
   }
 
-  console.log(`[CAPTCHA] 最终 siteKey: ${siteKey}`);
-  console.log(`[CAPTCHA] 页面 URL: ${page.url()}`);
+  console.log(`[CAPTCHA] 最终 siteKey: ${siteKey}, URL: ${page.url()}`);
 
-  // 调用 2Captcha 解决
-  const solveStartTime = Date.now();
+  // 调用 CapSolver
   const token = await solveRecaptchaV2(siteKey, page.url(), apiKey);
-  const solveTime = Date.now() - solveStartTime;
-  console.log(`[CAPTCHA] 获得 token (前20字符): ${token.substring(0, 20)}... (耗时: ${Math.round(solveTime / 1000)}s, 长度: ${token.length})`);
 
-  // 先重置 reCAPTCHA 状态（清除之前的错误状态）
+  // 重置 reCAPTCHA
   await page.evaluate(() => {
-    try {
-      if (window.grecaptcha) {
-        // 重置所有 widget
-        const widgets = document.querySelectorAll('.g-recaptcha');
-        for (let i = 0; i < (widgets.length || 1); i++) {
-          try { window.grecaptcha.reset(i); } catch (e) { /* 忽略 */ }
-        }
-      }
-    } catch (e) { /* 忽略 */ }
+    try { window.grecaptcha?.reset(0); } catch (e) {}
   });
   await page.waitForTimeout(500);
 
-  // 注入 token 并触发回调
+  // 注入 token
   const injectionResult = await page.evaluate((token) => {
-    const result = { textareaSet: false, callbackFound: null, callbackTriggered: false };
+    const result = { textareaSet: false, callbackTriggered: false, callbackFound: null };
 
-    // 方式1: 注入到所有 textarea
-    const textareas = document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]');
-    for (const textarea of textareas) {
-      // 使用 native setter 确保 React/Vue 等框架能检测到变化
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-      if (nativeInputValueSetter) {
-        nativeInputValueSetter.call(textarea, token);
-      } else {
-        textarea.value = token;
-      }
-      textarea.dispatchEvent(new Event('input', { bubbles: true }));
-      textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    // 设置 textarea
+    for (const ta of document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]')) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter ? setter.call(ta, token) : (ta.value = token);
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ta.dispatchEvent(new Event('change', { bubbles: true }));
       result.textareaSet = true;
     }
 
-    // 方式2: 查找 data-callback 属性
-    const callbackNames = [];
-    const recaptchaElements = document.querySelectorAll('[data-callback], .g-recaptcha, [data-sitekey]');
-    for (const el of recaptchaElements) {
+    // 查找并触发回调
+    const cbNames = [];
+    for (const el of document.querySelectorAll('[data-callback]')) {
       const cb = el.getAttribute('data-callback');
-      if (cb) callbackNames.push(cb);
+      if (cb) cbNames.push(cb);
     }
 
-    // 方式3: 从 ___grecaptcha_cfg 深度搜索所有函数
-    if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
-      for (const clientId in window.___grecaptcha_cfg.clients) {
-        const client = window.___grecaptcha_cfg.clients[clientId];
-        searchForCallbacks(client, callbackNames, 0);
+    // 常见回调名
+    cbNames.push('onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback',
+      'onCaptchaVerified', 'verifyCallback', 'onVerify', 'captchaVerified');
+
+    // 从 grecaptcha_cfg 搜索
+    if (window.___grecaptcha_cfg?.clients) {
+      for (const id in window.___grecaptcha_cfg.clients) {
+        searchCb(window.___grecaptcha_cfg.clients[id], cbNames, 0);
       }
     }
 
-    // 方式4: 常见的回调名
-    const commonNames = [
-      'onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback',
-      'onCaptchaVerified', 'verifyCallback', 'onVerify', 'captchaVerified',
-      'onRecaptcha', 'recaptchaVerified', 'grecaptchaCallback'
-    ];
-    callbackNames.push(...commonNames);
+    // 触发回调
+    for (const name of cbNames) {
+      if (name && typeof window[name] === 'function') {
+        try { window[name](token); result.callbackTriggered = true; result.callbackFound = name; } catch (e) {}
+      }
+    }
 
-    // 触发所有找到的回调
-    for (const name of callbackNames) {
-      if (typeof window[name] === 'function') {
+    // 深度搜索并触发
+    if (window.___grecaptcha_cfg?.clients) {
+      for (const id in window.___grecaptcha_cfg.clients) {
+        triggerDeep(window.___grecaptcha_cfg.clients[id], token, 0, result);
+      }
+    }
+
+    function searchCb(obj, names, d) {
+      if (d > 8 || !obj || typeof obj !== 'object') return;
+      const skip = ['CSSStyleSheet', 'CSSStyleDeclaration', 'CSSRule', 'StyleSheet'];
+      if (obj.constructor?.name && skip.includes(obj.constructor.name)) return;
+      try { for (const k in obj) {
         try {
-          window[name](token);
-          result.callbackTriggered = true;
-          result.callbackFound = name;
-        } catch (e) { /* 忽略 */ }
-      }
+          if (typeof obj[k] === 'function' && (k === 'callback' || k.includes('allback'))) names.push(null);
+          if (typeof obj[k] === 'object' && obj[k] !== null) searchCb(obj[k], names, d + 1);
+        } catch (e) {}
+      }} catch (e) {}
     }
 
-    // 方式5: 从 ___grecaptcha_cfg 中直接调用找到的函数
-    if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
-      for (const clientId in window.___grecaptcha_cfg.clients) {
-        const client = window.___grecaptcha_cfg.clients[clientId];
-        triggerCallbacksDeep(client, token, 0, result);
-      }
-    }
-
-    function searchForCallbacks(obj, names, depth) {
-      if (depth > 8 || !obj || typeof obj !== 'object') return;
-      // 跳过浏览器安全限制的对象
-      const skipTypes = ['CSSStyleSheet', 'CSSStyleDeclaration', 'CSSRule', 'CSSRuleList',
-        'StyleSheet', 'StyleSheetList', 'DOMStringMap', 'NamedNodeMap', 'DOMTokenList'];
-      if (obj.constructor && skipTypes.includes(obj.constructor.name)) return;
-      try {
-        for (const key in obj) {
-          try {
-            if (typeof obj[key] === 'function' && !key.startsWith('__')) {
-              if (key === 'callback' || key.includes('Callback') || key.includes('callback')) {
-                names.push(null); // 标记需要直接调用
-              }
-            }
-            if (typeof obj[key] === 'object' && obj[key] !== null && key !== 'prototype' && key !== '__proto__') {
-              searchForCallbacks(obj[key], names, depth + 1);
-            }
-          } catch (e) { /* 跳过不可访问的属性 */ }
-        }
-      } catch (e) { /* 跳过不可枚举的对象 */ }
-    }
-
-    function triggerCallbacksDeep(obj, token, depth, result) {
-      if (depth > 8 || !obj || typeof obj !== 'object') return;
-      const skipTypes = ['CSSStyleSheet', 'CSSStyleDeclaration', 'CSSRule', 'CSSRuleList',
-        'StyleSheet', 'StyleSheetList', 'DOMStringMap', 'NamedNodeMap', 'DOMTokenList'];
-      if (obj.constructor && skipTypes.includes(obj.constructor.name)) return;
-      try {
-        for (const key in obj) {
-          try {
-            if (typeof obj[key] === 'function' && !key.startsWith('__')) {
-              if (key === 'callback' || key.includes('Callback') || key.includes('callback') ||
-                  key === 'success' || key === 'onSuccess') {
-                try {
-                  obj[key](token);
-                  result.callbackTriggered = true;
-                  result.callbackFound = `obj.${key}`;
-                } catch (e) { /* 忽略 */ }
-              }
-            }
-            if (typeof obj[key] === 'object' && obj[key] !== null && key !== 'prototype' && key !== '__proto__') {
-              triggerCallbacksDeep(obj[key], token, depth + 1, result);
-            }
-          } catch (e) { /* 跳过不可访问的属性 */ }
-        }
-      } catch (e) { /* 跳过不可枚举的对象 */ }
+    function triggerDeep(obj, token, d, r) {
+      if (d > 8 || !obj || typeof obj !== 'object') return;
+      const skip = ['CSSStyleSheet', 'CSSStyleDeclaration', 'CSSRule', 'StyleSheet'];
+      if (obj.constructor?.name && skip.includes(obj.constructor.name)) return;
+      try { for (const k in obj) {
+        try {
+          if (typeof obj[k] === 'function' && (k === 'callback' || k.includes('allback') || k === 'success' || k === 'onSuccess')) {
+            try { obj[k](token); r.callbackTriggered = true; r.callbackFound = `obj.${k}`; } catch (e) {}
+          }
+          if (typeof obj[k] === 'object' && obj[k] !== null) triggerDeep(obj[k], token, d + 1, r);
+        } catch (e) {}
+      }} catch (e) {}
     }
 
     return result;
   }, token);
 
-  console.log(`[CAPTCHA] 注入结果: textarea=${injectionResult.textareaSet}, 回调=${injectionResult.callbackFound || '未找到'}, 触发=${injectionResult.callbackTriggered}`);
+  console.log(`[CAPTCHA] 注入: textarea=${injectionResult.textareaSet}, 回调=${injectionResult.callbackFound || '未找到'}, 触发=${injectionResult.callbackTriggered}`);
 
-  // 验证注入结果
-  const verifyResult = await page.evaluate(() => {
-    const textarea = document.getElementById('g-recaptcha-response');
-    const textareaLen = textarea ? textarea.value?.length : 0;
-    let grecaptchaResponse = 'no grecaptcha';
-    try {
-      if (window.grecaptcha) {
-        const resp = window.grecaptcha.getResponse(0);
-        grecaptchaResponse = resp ? `ok(${resp.length} chars)` : 'empty';
-      }
-    } catch (e) {
-      grecaptchaResponse = `error: ${e.message}`;
-    }
-    return { textareaLen, grecaptchaResponse };
+  // 验证
+  const verify = await page.evaluate(() => {
+    const ta = document.getElementById('g-recaptcha-response');
+    let gr = 'no grecaptcha';
+    try { const r = window.grecaptcha?.getResponse(0); gr = r ? `ok(${r.length})` : 'empty'; } catch (e) { gr = `err: ${e.message}`; }
+    return { taLen: ta?.value?.length || 0, gr };
   });
-  console.log(`[CAPTCHA] 验证 - textarea长度: ${verifyResult.textareaLen}, grecaptcha: ${verifyResult.grecaptchaResponse}`);
+  console.log(`[CAPTCHA] 验证 - textarea: ${verify.taLen}, grecaptcha: ${verify.gr}`);
 
   return true;
 }
 
 /**
  * 在页面中检测并解决 Cloudflare Turnstile
- * @param {import('playwright').Page} page - Playwright 页面对象
- * @param {string} apiKey - 2Captcha API key
- * @returns {Promise<boolean>} - 是否成功解决
  */
 export async function detectAndSolveTurnstile(page, apiKey) {
-  // 检测 Turnstile
-  const turnstileIframe = page.locator('iframe[src*="challenges.cloudflare.com"]');
-  const hasTurnstile = await turnstileIframe.count() > 0;
+  const has = await page.locator('iframe[src*="challenges.cloudflare.com"]').count();
+  if (!has) return false;
 
-  if (!hasTurnstile) {
-    console.log('[CAPTCHA] 未检测到 Turnstile');
-    return false;
-  }
-
-  // 提取 sitekey
-  let siteKey = await page.evaluate(() => {
-    const turnstileDiv = document.querySelector('[data-sitekey]');
-    if (turnstileDiv) return turnstileDiv.getAttribute('data-sitekey');
-
-    // 从 input 中提取
-    const input = document.querySelector('input[name="cf-turnstile-response"], input[name="g-recaptcha-response"]');
-    if (input?.parentElement) {
-      return input.parentElement.getAttribute('data-sitekey');
-    }
-
-    return null;
+  const siteKey = await page.evaluate(() => {
+    return document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') ||
+      document.querySelector('input[name="cf-turnstile-response"]')?.parentElement?.getAttribute('data-sitekey') ||
+      null;
   });
 
-  if (!siteKey) {
-    console.log('[CAPTCHA] 检测到 Turnstile 但无法提取 sitekey');
-    return false;
-  }
-
-  console.log(`[CAPTCHA] 找到 Turnstile siteKey: ${siteKey}`);
+  if (!siteKey) return false;
+  console.log(`[CAPTCHA] Turnstile siteKey: ${siteKey}`);
 
   const token = await solveTurnstile(siteKey, page.url(), apiKey);
 
-  // 注入 token
   await page.evaluate((token) => {
-    // Turnstile 的 response 字段
-    const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-    if (cfInput) cfInput.value = token;
-
-    // 也可能用 g-recaptcha-response
-    const recaptchaInput = document.querySelector('input[name="g-recaptcha-response"]');
-    if (recaptchaInput) recaptchaInput.value = token;
-
-    // 尝试触发回调
-    if (window.turnstile && window.turnstile.getResponse) {
-      // Turnstile widget 回调
-      const callbacks = document.querySelectorAll('[data-callback]');
-      for (const el of callbacks) {
-        const cbName = el.getAttribute('data-callback');
-        if (typeof window[cbName] === 'function') {
-          window[cbName](token);
-        }
-      }
-    }
+    const cf = document.querySelector('input[name="cf-turnstile-response"]');
+    if (cf) cf.value = token;
+    const gr = document.querySelector('input[name="g-recaptcha-response"]');
+    if (gr) gr.value = token;
   }, token);
 
-  console.log('[CAPTCHA] Turnstile Token 已注入页面');
   return true;
 }
