@@ -185,7 +185,7 @@ async function loginWithAccount(username, password, index) {
 }
 
 async function attemptLogin(username, password, index, retryCount) {
-  const OVERALL_TIMEOUT = 240_000; // 4 分钟整体超时
+  const OVERALL_TIMEOUT = 300_000; // 5 分钟整体超时
 
   // 包装整体超时
   return Promise.race([
@@ -300,13 +300,9 @@ async function attemptLoginCore(username, password, index, retryCount) {
     });
     console.log(`[${username}] 页面调试信息: ${JSON.stringify(debugInfo)}`);
 
-    console.log(`[${username}] 检测是否有 reCAPTCHA...`);
-    const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
-
-    // 发送调试信息到飞书
+    // 先发调试信息到飞书（在 2Captcha 调用之前）
     const debugMsg = [
       `API Key: ${apiKey ? '已配置' : '未配置'}`,
-      `reCAPTCHA 检测: ${recaptchaSolved ? '成功' : '未检测到/失败'}`,
       `iframe 数量: ${debugInfo.iframeCount}`,
       `iframe 列表: ${debugInfo.iframeSrcs.join(' | ')}`,
       `grecaptcha 对象: ${debugInfo.hasGrecaptcha}`,
@@ -316,11 +312,14 @@ async function attemptLoginCore(username, password, index, retryCount) {
       `URL: ${debugInfo.url}`
     ].join('\n');
     await notifyFeishu({
-      ok: recaptchaSolved,
-      stage: 'reCAPTCHA 检测',
+      ok: true,
+      stage: '页面状态',
       msg: debugMsg,
       username
     });
+
+    console.log(`[${username}] 检测是否有 reCAPTCHA...`);
+    const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
 
     if (recaptchaSolved) {
       console.log(`[${username}] ✅ reCAPTCHA token 已注入`);
