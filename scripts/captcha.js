@@ -190,47 +190,29 @@ export async function detectAndSolveRecaptcha(page, apiKey) {
       }
     } catch (e) {}
 
-    // 3. 直接访问已知的回调路径 + 搜索其他回调
+    // 3. 动态搜索 reCAPTCHA 回调函数（属性名每次加载都不同）
     try {
       const cfg = window.___grecaptcha_cfg;
       if (cfg?.clients) {
         for (const [cid, client] of Object.entries(cfg.clients)) {
-          // 直接访问 clients[id].g.g.callback（已知路径）
-          try {
-            const gg = client.g?.g;
-            if (gg) {
-              // 记录所有属性
-              const ggKeys = Object.keys(gg);
-              result.cfgInfo = `g.g keys: ${ggKeys.join(',')}`;
-
-              // 直接调用 callback
-              if (typeof gg['callback'] === 'function') {
-                gg['callback'](token);
-                result.cb = `clients.${cid}.g.g.callback`;
-              }
-
-              // 也检查其他可能的回调名
-              const cbNames = ['callback', 'expired-callback', 'error-callback'];
-              for (const name of cbNames) {
-                if (name !== 'callback' && typeof gg[name] === 'function') {
-                  // 只记录，不调用 expired/error
-                  result.cfgInfo += ` | ${name}=func`;
+          // 遍历 client 的所有属性，找包含 callback 的对象
+          for (const [k1, v1] of Object.entries(client)) {
+            if (v1 && typeof v1 === 'object' && !(v1 instanceof HTMLElement)) {
+              for (const [k2, v2] of Object.entries(v1)) {
+                // 找到包含 sitekey 和 callback 的对象
+                if (v2 && typeof v2 === 'object' && v2.sitekey && typeof v2['callback'] === 'function') {
+                  result.cfgInfo = `path=clients.${cid}.${k1}.${k2}, sitekey=${v2.sitekey?.substring(0, 20)}`;
+                  try {
+                    v2['callback'](token);
+                    result.cb = `clients.${cid}.${k1}.${k2}.callback`;
+                  } catch (e) { result.cfgError = e.message; }
+                  break;
                 }
               }
-            }
-          } catch (e) { result.cfgError = e.message; }
-
-          // 如果直接路径没找到，遍历 client 的第一层属性
-          if (!result.cb) {
-            for (const [k, v] of Object.entries(client)) {
-              if (typeof v === 'function') {
-                const funcStr = Function.prototype.toString.call(v).substring(0, 80);
-                if (funcStr.includes('callback') || k === 'callback') {
-                  try { v(token); result.cb = `clients.${cid}.${k}`; break; } catch {}
-                }
-              }
+              if (result.cb) break;
             }
           }
+          if (result.cb) break;
         }
       }
     } catch (e) { result.cfgError2 = e.message; }
