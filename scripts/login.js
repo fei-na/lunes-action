@@ -8,7 +8,7 @@
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
-import { detectAndSolveRecaptcha, detectAndSolveTurnstile, checkBalance } from './captcha.js';
+import { detectAndSolveRecaptcha, detectAndSolveTurnstile } from './captcha.js';
 
 // 启用 stealth 插件，绕过自动化检测
 chromium.use(StealthPlugin());
@@ -303,16 +303,8 @@ async function attemptLoginCore(username, password, index, retryCount) {
     console.log(`[${username}] 检测是否有 reCAPTCHA...`);
     const recaptchaSolved = apiKey ? await detectAndSolveRecaptcha(page, apiKey) : false;
 
-    // 检查 2Captcha 余额
-    let balanceInfo = '未检查';
-    if (apiKey) {
-      const bal = await checkBalance(apiKey);
-      balanceInfo = bal.ok ? `$${bal.balance}` : `错误: ${bal.error}`;
-    }
-
     // 发送调试信息到飞书
     const debugMsg = [
-      `2Captcha 余额: ${balanceInfo}`,
       `API Key: ${apiKey ? '已配置' : '未配置'}`,
       `reCAPTCHA 检测: ${recaptchaSolved ? '成功' : '未检测到/失败'}`,
       `iframe 数量: ${debugInfo.iframeCount}`,

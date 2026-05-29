@@ -6,39 +6,10 @@ const POLL_INTERVAL = 5000;
 const MAX_WAIT_TIME = 180_000;
 
 /**
- * 检查 2Captcha 余额
- */
-export async function checkBalance(apiKey) {
-  try {
-    const url = `${TWOCAPTCHA_API_BASE}/res.php?key=${apiKey}&action=getbalance&json=1`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-    const data = await res.json();
-    if (data.status === 1) {
-      return { ok: true, balance: data.request };
-    }
-    return { ok: false, error: data.request };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-}
-
-/**
  * 提交 reCAPTCHA v2 任务到 2Captcha
  */
 export async function solveRecaptchaV2(siteKey, pageUrl, apiKey) {
-  console.log(`[CAPTCHA] 2Captcha 解决 reCAPTCHA v2`);
-  console.log(`[CAPTCHA] siteKey: ${siteKey}`);
-  console.log(`[CAPTCHA] pageUrl: ${pageUrl}`);
-
-  // 先检查余额
-  const balance = await checkBalance(apiKey);
-  console.log(`[CAPTCHA] 余额: ${JSON.stringify(balance)}`);
-  if (!balance.ok) {
-    throw new Error(`2Captcha 余额查询失败: ${balance.error}`);
-  }
-  if (parseFloat(balance.balance) < 0.01) {
-    throw new Error(`2Captcha 余额不足: ${balance.balance}`);
-  }
+  console.log(`[CAPTCHA] siteKey: ${siteKey}, URL: ${pageUrl}`);
 
   // 提交任务
   const params = new URLSearchParams({
